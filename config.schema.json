@@ -4,7 +4,7 @@
   "singular": true,
   "customUi": true,
   "customUiPath": "./dist/homebridge-ui",
-  "headerDisplay": "See the [GitHub page](https://github.com/simplytoast1/Ring-Smoke-Detectors) for setup instructions. Use the button below to generate a refresh token from your Ring account.",
+  "headerDisplay": "Log in with your Ring account to discover and manage your Kidde smoke detectors. See the [GitHub page](https://github.com/simplytoast1/Ring-Smoke-Detectors) for more info.",
   "schema": {
     "type": "object",
     "properties": {
@@ -17,8 +17,7 @@
       "refreshToken": {
         "title": "Refresh Token",
         "type": "string",
-        "required": true,
-        "description": "Click \"Generate New Refresh Token\" above to authenticate with your Ring account"
+        "description": "Generated automatically when you log in via the settings UI"
       },
       "locationIds": {
         "title": "Location IDs",
