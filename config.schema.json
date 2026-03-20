@@ -1,0 +1,37 @@
+{
+  "pluginAlias": "RingSmokeDetectors",
+  "pluginType": "platform",
+  "singular": true,
+  "customUi": true,
+  "customUiPath": "./dist/homebridge-ui",
+  "headerDisplay": "See the [GitHub page](https://github.com/simplytoast1/Ring-Smoke-Detectors) for setup instructions. Use the button below to generate a refresh token from your Ring account.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "title": "Name",
+        "type": "string",
+        "default": "Ring Smoke Detectors",
+        "description": "Exposes Kidde/Ring smart smoke and CO detectors to HomeKit via Homebridge"
+      },
+      "refreshToken": {
+        "title": "Refresh Token",
+        "type": "string",
+        "required": true,
+        "description": "Click \"Generate New Refresh Token\" above to authenticate with your Ring account"
+      },
+      "locationIds": {
+        "title": "Location IDs",
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Optional: limit to specific Ring location IDs"
+      },
+      "debug": {
+        "title": "Debug Logging",
+        "type": "boolean",
+        "default": false
+      }
+    },
+    "required": ["refreshToken"]
+  }
+}

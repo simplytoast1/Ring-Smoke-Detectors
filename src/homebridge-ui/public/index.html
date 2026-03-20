@@ -1,0 +1,418 @@
+<!--
+  Homebridge Custom UI for Ring Smoke Detectors
+
+  States:
+  1. Not authenticated — show "Log In" button and login form
+  2. Authenticated — auto-discover devices, show device list with
+     model info, custom names, and show/hide toggles
+-->
+<style>
+  .ring-container {
+    max-width: 600px;
+    margin: 0 auto;
+  }
+  .hidden { display: none; }
+  .form-group {
+    margin-bottom: 15px;
+  }
+  .form-group label {
+    display: block;
+    margin-bottom: 5px;
+    font-weight: bold;
+  }
+  .form-group input {
+    width: 100%;
+    padding: 8px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    box-sizing: border-box;
+  }
+  .btn {
+    padding: 10px 20px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    margin-right: 8px;
+  }
+  .btn-primary { background-color: #007bff; color: white; }
+  .btn-secondary { background-color: #6c757d; color: white; }
+  .btn-sm { padding: 6px 14px; font-size: 13px; }
+  .btn:hover { opacity: 0.9; }
+  .info-text {
+    color: #888;
+    font-size: 13px;
+    margin-bottom: 15px;
+  }
+  .status-bar {
+    margin-bottom: 15px;
+    padding: 10px 14px;
+    border-radius: 4px;
+    font-size: 14px;
+  }
+  .status-bar.success { background-color: #d4edda; color: #155724; }
+  .status-bar.warning { background-color: #f8d7da; color: #721c24; }
+  .status-bar.info { background-color: #e2e3e5; color: #383d41; }
+
+  /* Device cards */
+  .device-list { margin-top: 15px; }
+  .device-card {
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 14px;
+    margin-bottom: 12px;
+    background: #fafafa;
+  }
+  .device-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+  }
+  .device-model {
+    font-size: 12px;
+    color: #888;
+    margin-bottom: 6px;
+  }
+  .device-location {
+    font-size: 12px;
+    color: #888;
+  }
+  .device-name-input {
+    width: 100%;
+    padding: 6px 8px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: 14px;
+    box-sizing: border-box;
+    margin-bottom: 6px;
+  }
+
+  /* Checkbox row */
+  .checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 6px;
+  }
+  .checkbox-row input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    cursor: pointer;
+  }
+  .checkbox-row label {
+    font-size: 13px;
+    color: #555;
+    cursor: pointer;
+  }
+
+  .actions-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 15px;
+  }
+</style>
+
+<div class="ring-container">
+  <div id="statusBar" class="status-bar hidden"></div>
+
+  <!-- Not authenticated: show login -->
+  <div id="loginSection">
+    <button id="loginBtn" class="btn btn-primary" onclick="showLoginForm()">Log In</button>
+  </div>
+
+  <!-- Login form -->
+  <div id="loginForm" class="hidden">
+    <p class="info-text">
+      Enter your Ring account credentials. These are sent directly to Ring's
+      servers and are not stored.
+    </p>
+    <div class="form-group">
+      <label for="email">Ring Email</label>
+      <input type="email" id="email" placeholder="your@email.com" />
+    </div>
+    <div class="form-group">
+      <label for="password">Ring Password</label>
+      <input type="password" id="password" placeholder="Password" />
+    </div>
+    <button class="btn btn-primary" onclick="sendCode()">Log In</button>
+    <button class="btn btn-secondary" onclick="cancelLogin()">Cancel</button>
+  </div>
+
+  <!-- 2FA form -->
+  <div id="codeForm" class="hidden">
+    <p id="codePrompt" class="info-text"></p>
+    <div class="form-group">
+      <label for="code">Verification Code</label>
+      <input type="text" id="code" placeholder="Enter code" />
+    </div>
+    <button class="btn btn-primary" onclick="submitCode()">Submit</button>
+    <button class="btn btn-secondary" onclick="cancelLogin()">Cancel</button>
+  </div>
+
+  <!-- Authenticated: device list -->
+  <div id="deviceSection" class="hidden">
+    <div id="deviceList" class="device-list"></div>
+    <div class="actions-row">
+      <button class="btn btn-primary" onclick="saveDeviceSettings()">Save</button>
+      <button class="btn btn-secondary btn-sm" onclick="refreshDevices()">Refresh Devices</button>
+      <button class="btn btn-secondary btn-sm" onclick="showLoginForm()">Re-authenticate</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  let currentEmail = '';
+  let currentPassword = '';
+  let discoveredDevices = [];
+
+  const modelNames = {
+    'sensor_bluejay_wsc': 'Kidde Smart Smoke + CO Alarm (Wired)',
+    'sensor_bluejay_ws': 'Kidde Smart Smoke Alarm (Wired)',
+    'sensor_bluejay_sc': 'Kidde Smart Smoke + CO Alarm (Battery)',
+  };
+
+  function getModelName(deviceType) {
+    for (const [key, name] of Object.entries(modelNames)) {
+      if (deviceType.includes(key)) return name;
+    }
+    return deviceType;
+  }
+
+  function showStatus(message, type) {
+    const el = document.getElementById('statusBar');
+    el.className = 'status-bar ' + type;
+    el.textContent = message;
+    el.classList.remove('hidden');
+  }
+
+  function hideStatus() {
+    document.getElementById('statusBar').classList.add('hidden');
+  }
+
+  // ─── Initialization ──────────────────────────────────────────────────
+
+  (async function init() {
+    const config = await homebridge.getPluginConfig();
+    const pluginConfig = config[0] || {};
+
+    if (pluginConfig.refreshToken) {
+      showStatus('Authenticated. Discovering devices...', 'success');
+      document.getElementById('loginSection').classList.add('hidden');
+      document.getElementById('deviceSection').classList.remove('hidden');
+      await loadDevices(pluginConfig);
+    } else {
+      showStatus('Log in with your Ring account to connect your smoke detectors.', 'warning');
+    }
+  })();
+
+  // ─── Login ────────────────────────────────────────────────────────────
+
+  function showLoginForm() {
+    document.getElementById('loginSection').classList.add('hidden');
+    document.getElementById('deviceSection').classList.add('hidden');
+    document.getElementById('codeForm').classList.add('hidden');
+    document.getElementById('loginForm').classList.remove('hidden');
+    hideStatus();
+  }
+
+  function cancelLogin() {
+    document.getElementById('loginForm').classList.add('hidden');
+    document.getElementById('codeForm').classList.add('hidden');
+    currentEmail = '';
+    currentPassword = '';
+
+    // Show the right section based on auth state
+    homebridge.getPluginConfig().then(config => {
+      const pluginConfig = config[0] || {};
+      if (pluginConfig.refreshToken) {
+        showStatus('Authenticated.', 'success');
+        document.getElementById('deviceSection').classList.remove('hidden');
+      } else {
+        showStatus('Log in with your Ring account to connect your smoke detectors.', 'warning');
+        document.getElementById('loginSection').classList.remove('hidden');
+      }
+    });
+  }
+
+  async function sendCode() {
+    const email = document.getElementById('email').value;
+    const password = document.getElementById('password').value;
+    if (!email || !password) {
+      homebridge.toast.error('Please enter both email and password.');
+      return;
+    }
+
+    currentEmail = email;
+    currentPassword = password;
+    homebridge.showSpinner();
+
+    try {
+      const response = await homebridge.request('/send-code', { email, password });
+      if (response.refreshToken) {
+        await saveToken(response.refreshToken);
+      } else if (response.codePrompt) {
+        document.getElementById('codePrompt').textContent = response.codePrompt;
+        document.getElementById('loginForm').classList.add('hidden');
+        document.getElementById('codeForm').classList.remove('hidden');
+      }
+    } catch (e) {
+      homebridge.toast.error(e.message || 'Login failed. Please check your credentials.');
+    } finally {
+      homebridge.hideSpinner();
+    }
+  }
+
+  async function submitCode() {
+    const code = document.getElementById('code').value;
+    if (!code) {
+      homebridge.toast.error('Please enter the verification code.');
+      return;
+    }
+
+    homebridge.showSpinner();
+    try {
+      const response = await homebridge.request('/token', {
+        email: currentEmail,
+        password: currentPassword,
+        code,
+      });
+      if (response.refreshToken) {
+        await saveToken(response.refreshToken);
+      }
+    } catch (e) {
+      homebridge.toast.error(e.message || 'Verification failed. Please try again.');
+    } finally {
+      homebridge.hideSpinner();
+    }
+  }
+
+  async function saveToken(refreshToken) {
+    const config = await homebridge.getPluginConfig();
+    const pluginConfig = config[0] || { platform: 'RingSmokeDetectors' };
+    pluginConfig.refreshToken = refreshToken;
+
+    await homebridge.updatePluginConfig([pluginConfig]);
+    await homebridge.savePluginConfig();
+
+    homebridge.toast.success('Logged in successfully!');
+    currentEmail = '';
+    currentPassword = '';
+
+    // Transition to authenticated state
+    document.getElementById('loginForm').classList.add('hidden');
+    document.getElementById('codeForm').classList.add('hidden');
+    document.getElementById('loginSection').classList.add('hidden');
+    document.getElementById('deviceSection').classList.remove('hidden');
+    showStatus('Authenticated. Discovering devices...', 'success');
+
+    await loadDevices(pluginConfig);
+  }
+
+  // ─── Device Discovery ─────────────────────────────────────────────────
+
+  async function loadDevices(pluginConfig) {
+    homebridge.showSpinner();
+    try {
+      const response = await homebridge.request('/devices', {
+        refreshToken: pluginConfig.refreshToken,
+      });
+
+      discoveredDevices = response.devices || [];
+      renderDeviceList(pluginConfig);
+
+      if (discoveredDevices.length === 0) {
+        showStatus('No Kidde smoke detectors found. Make sure your devices are set up in the Ring app.', 'info');
+      } else {
+        showStatus(`Found ${discoveredDevices.length} device(s).`, 'success');
+      }
+    } catch (e) {
+      showStatus('Failed to discover devices. Check your connection and try again.', 'warning');
+    } finally {
+      homebridge.hideSpinner();
+    }
+  }
+
+  async function refreshDevices() {
+    const config = await homebridge.getPluginConfig();
+    const pluginConfig = config[0] || {};
+    if (!pluginConfig.refreshToken) {
+      homebridge.toast.error('Not authenticated.');
+      return;
+    }
+    showStatus('Discovering devices...', 'success');
+    await loadDevices(pluginConfig);
+  }
+
+  function renderDeviceList(pluginConfig) {
+    const container = document.getElementById('deviceList');
+    const hiddenDevices = pluginConfig.hiddenDevices || [];
+    const deviceNames = pluginConfig.deviceNames || {};
+
+    if (discoveredDevices.length === 0) {
+      container.innerHTML = '<p class="info-text">No devices discovered.</p>';
+      return;
+    }
+
+    container.innerHTML = discoveredDevices.map(device => {
+      const isVisible = !hiddenDevices.includes(device.zid);
+      const customName = deviceNames[device.zid] || '';
+      const model = getModelName(device.deviceType);
+      const battery = device.batteryLevel != null
+        ? ` &middot; Battery: ${device.batteryLevel}%`
+        : '';
+
+      return `
+        <div class="device-card" data-zid="${device.zid}">
+          <div class="device-model">${model}${battery}</div>
+          <input
+            class="device-name-input"
+            type="text"
+            placeholder="${device.name}"
+            value="${customName}"
+            data-zid="${device.zid}"
+            data-original="${device.name}"
+          />
+          <div class="device-location">${device.locationName}</div>
+          <div class="checkbox-row">
+            <input type="checkbox" id="cb-${device.zid}" ${isVisible ? 'checked' : ''} data-zid="${device.zid}" />
+            <label for="cb-${device.zid}">Show in HomeKit</label>
+          </div>
+        </div>
+      `;
+    }).join('');
+
+  }
+
+  // ─── Save Settings ────────────────────────────────────────────────────
+
+  async function saveDeviceSettings() {
+    const config = await homebridge.getPluginConfig();
+    const pluginConfig = config[0] || { platform: 'RingSmokeDetectors' };
+
+    // Collect hidden devices (unchecked checkboxes)
+    const hiddenDevices = [];
+    document.querySelectorAll('.checkbox-row input').forEach(input => {
+      if (!input.checked) {
+        hiddenDevices.push(input.dataset.zid);
+      }
+    });
+
+    // Collect custom names (only if different from placeholder/original)
+    const deviceNames = {};
+    document.querySelectorAll('.device-name-input').forEach(input => {
+      const customName = input.value.trim();
+      if (customName && customName !== input.dataset.original) {
+        deviceNames[input.dataset.zid] = customName;
+      }
+    });
+
+    pluginConfig.hiddenDevices = hiddenDevices.length > 0 ? hiddenDevices : undefined;
+    pluginConfig.deviceNames = Object.keys(deviceNames).length > 0 ? deviceNames : undefined;
+
+    await homebridge.updatePluginConfig([pluginConfig]);
+    await homebridge.savePluginConfig();
+    homebridge.toast.success('Settings saved. Restart Homebridge to apply changes.');
+  }
+</script>
