@@ -1,7 +1,7 @@
 {
   "name": "homebridge-ring-smoke-detectors",
   "displayName": "Ring Smoke Detectors",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Homebridge plugin for Kidde/Ring smart smoke and CO detectors (hubless WiFi models)",
   "type": "module",
   "main": "dist/index.js",
