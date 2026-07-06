@@ -19,19 +19,26 @@ export class RestClientWrapper {
 
   constructor(
     refreshToken: string,
-    onTokenUpdate?: (newToken: string) => void,
+    onTokenUpdate?: (newToken: string, oldToken?: string) => void,
   ) {
     this.restClient = new RingRestClient({ refreshToken })
 
     // Establish a session immediately so requests can proceed
     this.restClient.refreshSession()
 
-    // Ring periodically rotates refresh tokens. When this happens, we need
-    // to persist the new token so the plugin can authenticate on next restart.
-    // Forward token rotation events to the caller (platform persists them)
+    // Ring periodically rotates refresh tokens. When this happens, we need to
+    // persist the new token so the plugin can authenticate on next restart.
+    // Both old and new are forwarded: the platform replaces the old token with
+    // the new one inside config.json.
     this.restClient.onRefreshTokenUpdated.subscribe(
-      ({ newRefreshToken }: { oldRefreshToken?: string; newRefreshToken: string }) => {
-        onTokenUpdate?.(newRefreshToken)
+      ({
+        oldRefreshToken,
+        newRefreshToken,
+      }: {
+        oldRefreshToken?: string
+        newRefreshToken: string
+      }) => {
+        onTokenUpdate?.(newRefreshToken, oldRefreshToken)
       },
     )
   }

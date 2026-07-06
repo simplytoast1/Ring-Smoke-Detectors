@@ -11,6 +11,7 @@
 
 import { HomebridgePluginUiServer, RequestError } from '@homebridge/plugin-ui-utils'
 import { RingRestClient, deviceApi, appApi } from '../ring-api/ring-rest-client.js'
+import { readDeviceCache } from '../ring-api/device-cache.js'
 import { WebSocket } from 'undici'
 
 interface LoginRequest {
@@ -26,6 +27,8 @@ interface TokenRequest {
 
 interface DevicesRequest {
   refreshToken: string
+  /** Force a live WebSocket discovery instead of reading the plugin's cache */
+  forceRefresh?: boolean
 }
 
 interface DiscoveredDevice {
@@ -101,20 +104,38 @@ class RingSmokeDetectorsUiServer extends HomebridgePluginUiServer {
   }
 
   /**
-   * Discover Kidde devices by connecting to Ring's WebSocket for each location.
-   * This runs the same discovery flow as the main plugin but returns the device
-   * list to the UI so users can see, rename, and hide devices.
+   * Return the list of Kidde devices for the settings UI.
    *
-   * IMPORTANT: authenticating here consumes the given refresh token (Ring
-   * rotates tokens on every exchange). The rotated replacement is returned
-   * as `refreshToken` in the response, and the UI MUST save it back to the
-   * config, otherwise the stored token is left invalid.
+   * By default this reads the cache the RUNNING PLUGIN writes after discovery,
+   * which requires NO authentication and therefore does not rotate the Ring
+   * token. That is the whole point: Ring's tokens are effectively single-use,
+   * so if the settings page authenticated on every open it could rotate the
+   * token out from under the running plugin and knock it offline. Reading the
+   * plugin's cache keeps the plugin the sole token consumer.
+   *
+   * A live WebSocket discovery (which DOES authenticate and rotate) happens
+   * only when the cache is empty (fresh setup, before the plugin has run) or
+   * when the user explicitly asks to refresh. In that case the rotated token
+   * is returned so the UI can persist it to config.json on Save.
    */
-  async discoverDevices({ refreshToken }: DevicesRequest) {
+  async discoverDevices({ refreshToken, forceRefresh }: DevicesRequest) {
     if (!refreshToken) {
       throw new RequestError('Not authenticated', { status: 400 })
     }
 
+    // Default path: read the plugin's cache. Never authenticate here, even if
+    // the cache is empty, because authenticating would rotate the running
+    // plugin's single-use token. An empty cache is reported so the UI can ask
+    // the user to log in (an explicit, expected auth) instead.
+    const storagePath = this.homebridgeStoragePath
+    if (!forceRefresh) {
+      const cached = storagePath ? await readDeviceCache(storagePath) : []
+      return { devices: cached, fromCache: true, cacheEmpty: cached.length === 0 }
+    }
+
+    // forceRefresh: an explicit login-time live discovery. This authenticates
+    // and rotates the token; the rotated token is returned so the UI persists
+    // it immediately.
     const client = new RingRestClient({ refreshToken })
 
     // Capture the rotated token so it can be handed back to the UI

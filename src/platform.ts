@@ -31,13 +31,13 @@
  * Ring outage can never wipe out the user's accessories, rooms, and
  * automations.
  *
- * REFRESH TOKEN PERSISTENCE: Ring rotates refresh tokens periodically.
- * We persist the latest token to a file in the Homebridge storage directory
- * so it survives restarts. The file records which config token the rotation
- * chain started from: if the user re-logs-in through the UI (writing a new
- * token to the config), the config token wins and the stale persisted chain
- * is discarded. If auth with a persisted token fails outright, we fall back
- * to the config token automatically.
+ * REFRESH TOKEN PERSISTENCE: Ring rotates refresh tokens periodically and the
+ * tokens are effectively single-use. We write each rotated token back into
+ * config.json (the single source of truth, matching homebridge-ring), so a
+ * fresh token always survives restarts. The plugin is the SOLE token consumer
+ * at runtime: the settings UI reads a device cache instead of authenticating,
+ * so opening the settings page never rotates the token. See config-store.ts
+ * and device-cache.ts.
  *
  * NEW DEVICE DETECTION: When the WebSocket reconnects (after disconnection
  * or server-initiated reconnect), it re-requests a fresh ticket which may
@@ -53,8 +53,6 @@ import type {
   PlatformAccessory,
   PlatformConfig,
 } from 'homebridge'
-import { writeFile, readFile, unlink, chmod } from 'node:fs/promises'
-import { join } from 'node:path'
 import { BehaviorSubject } from 'rxjs'
 import { hap } from './hap.js'
 import {
@@ -72,25 +70,22 @@ import {
   isKiddeDeviceType,
   isSmokeOnly,
 } from './ring-api/types.js'
+import {
+  updateConfigRefreshToken,
+  readConfigRefreshToken,
+} from './ring-api/config-store.js'
+import {
+  CachedDevice,
+  writeDeviceCache,
+} from './ring-api/device-cache.js'
 import { BaseAccessory } from './accessories/base-accessory.js'
 import { SmokeCoDetectorAccessory } from './accessories/smoke-co-detector.js'
 import { SmokeDetectorAccessory } from './accessories/smoke-detector.js'
-
-/** Filename for persisting the refresh token across restarts */
-const TOKEN_FILE = 'ring-smoke-detectors.token'
 
 /** First retry delay for a failed discovery run or location probe */
 const INITIAL_RETRY_DELAY_MS = 30_000
 /** Cap for discovery/location retry backoff */
 const MAX_RETRY_DELAY_MS = 15 * 60_000
-
-/** Persisted token file contents (JSON since v1.3.0, plain string before) */
-interface PersistedToken {
-  /** The config token this rotation chain started from */
-  configToken: string
-  /** The most recently rotated token */
-  latestToken: string
-}
 
 /** Outcome of probing one location */
 type ProbeOutcome = 'ok' | 'partial' | 'failed'
@@ -121,7 +116,7 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
   /** Active WebSocket connections (one per location with Kidde devices) */
   private readonly connections: SmokeDetectorWebSocket[] = []
 
-  /** Path to the Homebridge storage directory for persisting the refresh token */
+  /** Path to the Homebridge storage directory (for the device cache) */
   private readonly storagePath: string
 
   /** REST client for the current discovery run (kept for shutdown cleanup) */
@@ -130,11 +125,14 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
   /** Pending retry timers, cleared on shutdown */
   private readonly retryTimers: ReturnType<typeof setTimeout>[] = []
 
-  /** The refresh token currently in the Homebridge config */
-  private configToken = ''
+  /**
+   * All Kidde devices discovered so far, keyed by zid, for the settings-UI
+   * cache. Holds every device (including hidden ones) with its raw Ring name.
+   */
+  private readonly discoveredForCache = new Map<string, CachedDevice>()
 
-  /** Whether getRefreshToken() chose the persisted token over the config one */
-  private usedPersistedToken = false
+  /** zids seen during the current discovery run, used to prune removed devices */
+  private cacheZidsThisRun = new Set<string>()
 
   /** Set when Homebridge fires shutdown; stops all retry/discovery loops */
   private shuttingDown = false
@@ -180,97 +178,50 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
   }
 
   // ─── Refresh Token Persistence ─────────────────────────────────────────
+  //
+  // config.json is the single source of truth for the refresh token, matching
+  // the reference homebridge-ring plugin. On each rotation we write the new
+  // token back into config.json (config-store.ts), so a fresh token always
+  // survives restarts without a second file that could drift out of sync.
+  //
+  // The plugin is the SOLE token consumer at runtime: the settings UI reads a
+  // device cache instead of authenticating, so opening the settings page never
+  // rotates the token. Because Ring's tokens are effectively single-use, that
+  // single-consumer property is what keeps the running plugin from being
+  // knocked offline by routine settings-page use.
 
-  private get tokenFilePath(): string {
-    return join(this.storagePath, TOKEN_FILE)
+  /**
+   * The freshest refresh token: re-read from config.json on disk so a token a
+   * re-login wrote to config is picked up on the next discovery attempt. Falls
+   * back to the token Homebridge parsed at startup if the file can't be read.
+   */
+  private getStartToken(config: RingSmokeDetectorsConfig): string {
+    return readConfigRefreshToken(this.api) ?? config.refreshToken
   }
 
   /**
-   * Pick the refresh token to authenticate with.
-   *
-   * The persisted (rotated) token is only used when it descends from the
-   * token currently in the config. If the config token changed, the user
-   * re-logged-in through the UI, and that fresh token must win; the old
-   * persisted chain is dead. Legacy plain-string files (plugin <= 1.2.x)
-   * are treated as descending from the current config token, matching
-   * their old behavior, and are upgraded to the new format on the next
-   * rotation.
+   * Persist a rotated token by replacing the old one inside config.json.
+   * Wrapped so a write failure (read-only storage, permissions) is logged
+   * rather than surfacing as an unhandled rejection: this runs fire-and-forget
+   * from the rotation callback, and an uncaught rejection would take down the
+   * child bridge on modern Node.
    */
-  private async getRefreshToken(configToken: string): Promise<string> {
-    this.usedPersistedToken = false
+  private persistRefreshToken(newToken: string, oldToken?: string): void {
     try {
-      const raw = (await readFile(this.tokenFilePath, 'utf-8')).trim()
-      if (!raw) return configToken
-
-      let stored: Partial<PersistedToken>
-      try {
-        const parsed = JSON.parse(raw)
-        stored =
-          parsed && typeof parsed === 'object'
-            ? (parsed as Partial<PersistedToken>)
-            : { configToken, latestToken: raw }
-      } catch {
-        // Legacy format: the file is the rotated token itself
-        stored = { configToken, latestToken: raw }
-      }
-
-      if (stored.latestToken && stored.configToken === configToken) {
-        logDebug('Using persisted refresh token')
-        this.usedPersistedToken = true
-        return stored.latestToken
-      }
-
-      logInfo(
-        'Config refresh token changed (new login), using it instead of the persisted token',
-      )
-    } catch {
-      // File doesn't exist yet: use config token
-    }
-    return configToken
-  }
-
-  /**
-   * Persist the refresh token to disk so it survives Homebridge restarts.
-   * Ring rotates tokens periodically. If we don't persist the new one,
-   * the old token in the config becomes invalid and auth fails.
-   * The file contains the token, so keep it owner-readable only.
-   */
-  private async persistRefreshToken(token: string): Promise<void> {
-    try {
-      const contents: PersistedToken = {
-        configToken: this.configToken,
-        latestToken: token,
-      }
-      await writeFile(this.tokenFilePath, JSON.stringify(contents), {
-        encoding: 'utf-8',
-        mode: 0o600,
-      })
-      // writeFile only applies mode on creation; fix up pre-existing files
-      await chmod(this.tokenFilePath, 0o600)
-      logDebug('Persisted refresh token to storage')
+      updateConfigRefreshToken(this.api, oldToken, newToken)
     } catch (error) {
       logError(`Failed to persist refresh token: ${error}`)
-    }
-  }
-
-  /** Remove the persisted token (used when auth with it fails) */
-  private async clearPersistedToken(): Promise<void> {
-    try {
-      await unlink(this.tokenFilePath)
-      logInfo('Removed persisted refresh token, falling back to the config token')
-    } catch {
-      // Already gone
     }
   }
 
   // ─── Device Discovery ──────────────────────────────────────────────────
 
   /**
-   * Discovery orchestrator. Retries the whole run with exponential
-   * backoff on failure (auth error, locations fetch error) instead of
-   * leaving the plugin dead until the next Homebridge restart. If the
-   * persisted token turns out to be rejected, falls back to the config
-   * token once before backing off.
+   * Discovery orchestrator. Retries the whole run with exponential backoff on
+   * failure instead of leaving the plugin dead until the next restart. Each
+   * attempt re-reads the token from config.json, so a token written by a
+   * re-login is picked up automatically. A definitive auth failure logs a
+   * clear re-authenticate message and keeps retrying slowly.
    */
   private async discoverDevices(
     config: RingSmokeDetectorsConfig,
@@ -284,12 +235,13 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
       } catch (error) {
         if (this.shuttingDown) return
 
-        if (this.usedPersistedToken && isAuthFailure(error)) {
-          logWarn(
-            'Authentication failed with the persisted refresh token. Retrying with the token from the config.',
+        if (isAuthFailure(error)) {
+          // The token was rejected. A re-login writes a new token to config,
+          // which the next attempt re-reads. Until then, keep retrying slowly.
+          logError(
+            'Ring authentication failed. Your session may have been revoked or the token expired. ' +
+              'Open the plugin settings and click Re-authenticate.',
           )
-          await this.clearPersistedToken()
-          continue
         }
 
         attempt++
@@ -321,21 +273,22 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
   private async runDiscovery(
     config: RingSmokeDetectorsConfig,
   ): Promise<void> {
-    this.configToken = config.refreshToken
+    // Start from the freshest token in config.json (re-read each attempt so a
+    // re-login is picked up without a restart).
+    const refreshToken = this.getStartToken(config)
 
-    // Use the most recent refresh token (persisted rotation chain when it
-    // descends from the current config token, the config token otherwise)
-    const refreshToken = await this.getRefreshToken(config.refreshToken)
+    // Track which devices this run sees, so a clean run can prune the cache
+    this.cacheZidsThisRun = new Set()
 
     // Replace any client left over from a failed previous run
     this.client?.restClient.clearTimeouts()
 
-    // Create authenticated REST client (handles OAuth, token refresh, etc.)
-    this.client = new RestClientWrapper(refreshToken, (newToken) => {
-      // Ring rotates refresh tokens periodically. Persist the new token
-      // to a file so the plugin can authenticate on next restart.
+    // Create authenticated REST client (handles OAuth, token refresh, etc.).
+    this.client = new RestClientWrapper(refreshToken, (newToken, oldToken) => {
+      // Ring rotates refresh tokens periodically. Write the new token back
+      // into config.json so it survives restarts.
       logInfo('Ring refresh token updated')
-      this.persistRefreshToken(newToken)
+      this.persistRefreshToken(newToken, oldToken)
     })
 
     // Fetch ALL locations. We need to probe each one via WebSocket
@@ -387,6 +340,7 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
     // list. A transient outage must never masquerade as a removed device.
     if (cleanProbe) {
       this.removeStaleAccessories(discoveredDeviceIds)
+      this.pruneDeviceCache()
     } else {
       logWarn(
         'Skipping stale accessory cleanup: some locations could not be fully probed.',
@@ -445,6 +399,11 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
         `Location "${location.name}": discovered ${devices.length} device(s) via websocket`,
       )
 
+      // Publish to the settings-UI cache BEFORE creating accessories, since
+      // handleDiscoveredDevice mutates device.name with the user's override
+      // and the cache needs the raw Ring name.
+      this.updateDeviceCache(devices, location.name)
+
       // Create HomeKit accessories for each Kidde smoke/CO device
       for (const device of devices) {
         this.handleDiscoveredDevice(device, config, discoveredDeviceIds)
@@ -458,6 +417,7 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
       //   while an asset or the connection was down)
       ws.onDevices.subscribe({
         next: (updatedDevices) => {
+          this.updateDeviceCache(updatedDevices, location.name)
           for (const device of updatedDevices) {
             const existing = this.activeAccessories.get(device.zid)
             if (existing) {
@@ -563,6 +523,60 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
   }
 
   /**
+   * Update the settings-UI device cache with the devices from one location.
+   * Includes every Kidde device (hidden ones too, so the UI can show them)
+   * with its raw Ring name. Writes the file only when something changed, so
+   * routine reconnect polls don't churn the disk. Must be called with raw
+   * device data before handleDiscoveredDevice applies the name override.
+   */
+  private updateDeviceCache(
+    devices: SmokeDetectorDeviceData[],
+    locationName: string,
+  ): void {
+    let changed = false
+    for (const device of devices) {
+      if (!isKiddeDeviceType(device.deviceType) || !device.zid) continue
+      this.cacheZidsThisRun.add(device.zid)
+      const entry: CachedDevice = {
+        zid: device.zid,
+        name: device.name || 'Smoke Detector',
+        deviceType: device.deviceType,
+        locationName,
+        batteryLevel: device.batteryLevel,
+        batteryStatus: device.batteryStatus,
+      }
+      const prev = this.discoveredForCache.get(device.zid)
+      if (!prev || JSON.stringify(prev) !== JSON.stringify(entry)) {
+        this.discoveredForCache.set(device.zid, entry)
+        changed = true
+      }
+    }
+    if (changed) this.writeCache()
+  }
+
+  /**
+   * After a fully successful discovery run, drop cache entries for devices
+   * that were not seen this run (removed from the Ring account). Guarded on a
+   * clean run by the caller so a transient outage never wipes valid entries.
+   */
+  private pruneDeviceCache(): void {
+    let changed = false
+    for (const zid of this.discoveredForCache.keys()) {
+      if (!this.cacheZidsThisRun.has(zid)) {
+        this.discoveredForCache.delete(zid)
+        changed = true
+      }
+    }
+    if (changed) this.writeCache()
+  }
+
+  private writeCache(): void {
+    writeDeviceCache(this.storagePath, [
+      ...this.discoveredForCache.values(),
+    ]).catch((error) => logError(`Failed to write device cache: ${error}`))
+  }
+
+  /**
    * Process a discovered device: filter, apply config overrides, and create
    * the HomeKit accessory. Shared by initial discovery and reconnect-time
    * new device detection.
@@ -588,13 +602,14 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
       return
     }
 
-    // Apply custom display name from UI settings if configured
-    if (config.deviceNames?.[device.zid]) {
-      device.name = config.deviceNames[device.zid]
-    }
+    // Apply the custom display name (if any) on a shallow copy rather than
+    // mutating the shared device object, so the device cache keeps the raw
+    // Ring name regardless of call ordering.
+    const override = config.deviceNames?.[device.zid]
+    const forAccessory = override ? { ...device, name: override } : device
 
     discoveredDeviceIds.add(device.zid)
-    this.setupAccessory(device)
+    this.setupAccessory(forAccessory)
   }
 
   // ─── Accessory Management ──────────────────────────────────────────────

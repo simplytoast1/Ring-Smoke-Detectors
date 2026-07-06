@@ -324,24 +324,34 @@
     document.getElementById('deviceSection').classList.remove('hidden');
     showStatus('Authenticated. Discovering devices...', 'success');
 
-    await loadDevices(pluginConfig);
+    // Fresh login: the plugin hasn't cached devices yet, so discover live
+    await loadDevices(pluginConfig, true);
   }
 
   // ─── Device Discovery ─────────────────────────────────────────────────
 
-  async function loadDevices(pluginConfig) {
+  // forceRefresh=false reads the running plugin's device cache: no Ring auth,
+  // so it never rotates the plugin's token. forceRefresh=true does a live Ring
+  // discovery and is used ONLY right after login (the login token, not the
+  // running plugin's token, is what gets rotated there).
+  async function loadDevices(pluginConfig, forceRefresh) {
     homebridge.showSpinner();
     try {
       const response = await homebridge.request('/devices', {
         refreshToken: pluginConfig.refreshToken,
+        forceRefresh: !!forceRefresh,
       });
 
-      // Authenticating consumed the stored token and Ring rotated it. Hold
-      // the replacement (persisted on the next Save) rather than writing it
-      // here: a blocking savePluginConfig() in this path can hang and leave
-      // the spinner up forever.
+      // A live discovery rotates the token. Persist the replacement to config
+      // immediately (not deferred to Save) so config never holds a dead token.
+      // Fire-and-forget so a slow savePluginConfig can't hang the spinner.
       if (response.refreshToken && response.refreshToken !== pluginConfig.refreshToken) {
         rotatedRefreshToken = response.refreshToken;
+        pluginConfig.refreshToken = response.refreshToken;
+        Promise.resolve()
+          .then(() => homebridge.updatePluginConfig([pluginConfig]))
+          .then(() => homebridge.savePluginConfig())
+          .catch(() => { /* will still be saved on the user's Save */ });
       }
 
       discoveredDevices = response.devices || [];
@@ -349,14 +359,16 @@
 
       const failed = response.failedLocations || [];
       if (failed.length > 0) {
-        showStatus(`Found ${discoveredDevices.length} device(s), but some locations could not be reached: ${failed.join(', ')}. Check the Homebridge UI logs and try Refresh Devices.`, 'warning');
+        showStatus(`Found ${discoveredDevices.length} device(s), but some locations could not be reached: ${failed.join(', ')}. Check the Homebridge UI logs and try again.`, 'warning');
       } else if (discoveredDevices.length === 0) {
-        showStatus('No Kidde smoke detectors found. Make sure your devices are set up in the Ring app.', 'info');
+        showStatus(response.cacheEmpty
+          ? 'No devices discovered by the plugin yet. Log in above, or start/restart Homebridge so the plugin can scan Ring.'
+          : 'No Kidde smoke detectors found. Make sure your devices are set up in the Ring app.', 'info');
       } else {
-        showStatus(`Found ${discoveredDevices.length} device(s).`, 'success');
+        showStatus(`Found ${discoveredDevices.length} device(s)${response.fromCache ? ' (from plugin).' : '.'}`, 'success');
       }
     } catch (e) {
-      showStatus((e && e.message) ? `Failed to discover devices: ${e.message}` : 'Failed to discover devices. Check your connection and try again.', 'warning');
+      showStatus((e && e.message) ? `Failed to load devices: ${e.message}` : 'Failed to load devices. Check your connection and try again.', 'warning');
     } finally {
       homebridge.hideSpinner();
     }
@@ -369,8 +381,10 @@
       homebridge.toast.error('Not authenticated.');
       return;
     }
-    showStatus('Discovering devices...', 'success');
-    await loadDevices(pluginConfig);
+    // Re-read the plugin's cache (kept fresh by the plugin's ~60s polling).
+    // This does NOT authenticate, so it can't disturb the running plugin.
+    showStatus('Refreshing devices...', 'success');
+    await loadDevices(pluginConfig, false);
   }
 
   function renderDeviceList(pluginConfig) {

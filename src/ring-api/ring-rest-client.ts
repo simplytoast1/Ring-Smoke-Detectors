@@ -371,7 +371,9 @@ export class RingRestClient {
 
         // Definitive rejection (4xx): the token really is invalid.
         // Clear it and retry, which falls through to email/password
-        // if available, or throws a helpful error.
+        // if available, or throws a helpful error. The recursion is
+        // bounded: with the token cleared, getGrantData throws
+        // synchronously unless email/password credentials exist.
         this.refreshToken = undefined
         this.authConfig = undefined
         logError(requestError)
