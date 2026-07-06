@@ -25,10 +25,23 @@
         "items": { "type": "string" },
         "description": "Optional: limit to specific Ring location IDs"
       },
+      "hiddenDevices": {
+        "title": "Hidden Devices",
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Device IDs to exclude from HomeKit (managed via the settings UI)"
+      },
+      "deviceNames": {
+        "title": "Device Names",
+        "type": "object",
+        "additionalProperties": { "type": "string" },
+        "description": "Custom display names keyed by device ID (managed via the settings UI)"
+      },
       "debug": {
         "title": "Debug Logging",
         "type": "boolean",
-        "default": false
+        "default": false,
+        "description": "Log the plugin's debug messages at info level so they appear without running Homebridge in debug mode"
       }
     },
     "required": ["refreshToken"]

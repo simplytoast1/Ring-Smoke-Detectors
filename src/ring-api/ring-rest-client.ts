@@ -1,9 +1,9 @@
 /**
- * Ring REST Client — Lean OAuth + Authenticated Request Client
+ * Ring REST Client: Lean OAuth + Authenticated Request Client
  *
  * This is our own implementation of the Ring REST client, replacing the
  * ring-client-api dependency. We only need OAuth authentication, session
- * management, and authenticated HTTP requests — not cameras, streaming,
+ * management, and authenticated HTTP requests, not cameras, streaming,
  * push notifications, or any of the other heavy features that come with
  * the full ring-client-api package.
  *
@@ -107,7 +107,7 @@ function parseAuthConfig(rawRefreshToken?: string): AuthConfig | undefined {
 
 /**
  * Generate a hardware ID. Ring uses this to identify the "device" making
- * API requests. We use crypto.randomUUID() — no need for the systeminformation
+ * API requests. We use crypto.randomUUID(); no need for the systeminformation
  * package that ring-client-api uses.
  */
 function generateHardwareId(): string {
@@ -126,10 +126,16 @@ interface RequestOptions {
   allowNoResponse?: boolean
 }
 
+/** Max retry attempts for network-level failures (no HTTP response at all) */
+const MAX_NETWORK_RETRIES = 5
+
 /**
  * Make an HTTP request with automatic retry on network failures.
  * On non-response errors (network timeouts, DNS failures, etc.),
- * retries indefinitely with a 5-second delay between attempts.
+ * retries up to MAX_NETWORK_RETRIES times with a 5-second delay,
+ * then throws. A bounded retry keeps callers (websocket connect,
+ * discovery) from hanging forever during a total outage; their own
+ * backoff loops handle longer outages.
  */
 async function requestWithRetry<T>(
   options: RequestOptions,
@@ -185,6 +191,12 @@ async function requestWithRetry<T>(
     }
   } catch (e: any) {
     if (!e.response && !options.allowNoResponse) {
+      if (retryCount >= MAX_NETWORK_RETRIES) {
+        logError(
+          `Failed to reach Ring server at ${options.url} after ${retryCount + 1} attempts. ${e.message}`,
+        )
+        throw e
+      }
       if (retryCount > 0) {
         logError(
           `Retry #${retryCount} failed to reach Ring server at ${options.url}. ${e.message}. Trying again in 5 seconds...`,
@@ -211,7 +223,7 @@ export class RingRestClient {
   private readonly authOptions: AuthOptions
   private readonly baseSessionMetadata: Record<string, unknown>
 
-  /** Emits when Ring rotates the refresh token — listen to persist the new token */
+  /** Emits when Ring rotates the refresh token; listen to persist the new token */
   onRefreshTokenUpdated = new ReplaySubject<{
     oldRefreshToken?: string
     newRefreshToken: string
@@ -266,7 +278,13 @@ export class RingRestClient {
           this.timeouts.push(timeout)
         })
         .catch(() => {
-          // Errors are handled by the caller making the request
+          // Auth failed. Clear the cached promise so the NEXT request
+          // attempts a fresh token exchange instead of being stuck on
+          // this rejected promise until restart. The error itself is
+          // handled by the caller making the request.
+          if (this._authPromise === authPromise) {
+            this._authPromise = undefined
+          }
         })
     }
     return this._authPromise
@@ -337,8 +355,23 @@ export class RingRestClient {
       }
     } catch (requestError: any) {
       if (grantData.refresh_token) {
-        // Refresh token failed — clear it and retry (will fall through
-        // to email/password if available, or throw)
+        const status = requestError.response?.status
+
+        // Transient failures (network error, Ring 5xx, rate limiting) do
+        // NOT mean the refresh token is bad. Keep the credentials so the
+        // next attempt can retry with the same token. Wiping them here
+        // would leave the plugin permanently unauthenticated until restart
+        // over a hiccup on Ring's side.
+        if (status === undefined || status >= 500 || status === 429) {
+          logError(
+            `Failed to refresh Ring auth token (${status ?? 'network error'}). Will retry with the same refresh token.`,
+          )
+          throw requestError
+        }
+
+        // Definitive rejection (4xx): the token really is invalid.
+        // Clear it and retry, which falls through to email/password
+        // if available, or throws a helpful error.
         this.refreshToken = undefined
         this.authConfig = undefined
         logError(requestError)
@@ -413,7 +446,7 @@ export class RingRestClient {
   // ─── Session Management ──────────────────────────────────────────────
 
   /**
-   * Create a Ring session. This is required before making API requests —
+   * Create a Ring session. This is required before making API requests;
    * it registers this "device" with Ring's servers.
    */
   private async fetchNewSession(
@@ -446,10 +479,13 @@ export class RingRestClient {
           return this.getSession()
         }
         if (response.status === 429) {
+          // headers.get() returns null when the header is absent, and
+          // parseInt(null) is NaN, so guard on the PARSED value. The old
+          // isNaN(null) check was false, which produced delay(NaN), i.e.
+          // an instant zero-delay retry loop against a rate limiter.
           const retryAfter = e.response.headers.get('retry-after')
-          const waitSeconds = isNaN(retryAfter)
-            ? 200
-            : Number.parseInt(retryAfter, 10)
+          const parsed = Number.parseInt(retryAfter ?? '', 10)
+          const waitSeconds = Number.isNaN(parsed) ? 200 : parsed
           logError(
             `Session response rate limited. Waiting to retry after ${waitSeconds} seconds`,
           )
@@ -480,14 +516,20 @@ export class RingRestClient {
   /**
    * Make an authenticated request to a Ring API endpoint.
    * Automatically adds the OAuth bearer token, creates a session if needed,
-   * and handles 401/429/504 responses with appropriate retries.
+   * and handles 401/429/504 responses with bounded retries. Retries are
+   * capped (with backoff) so a persistent failure surfaces as an error the
+   * caller can handle instead of recursing forever, and each 401 retry is
+   * limited because every one performs a full token exchange.
    */
-  async request<T>(options: { url: string }): Promise<T> {
+  async request<T>(options: { url: string }, attempt = 1): Promise<T> {
     const { url } = options
     const initialSessionPromise = this.sessionPromise
 
     try {
-      await initialSessionPromise
+      // A failed session should not brick every request: proceed with the
+      // bearer token and let the hardware_id-not-found path below recover
+      // the session if an endpoint genuinely requires one.
+      await initialSessionPromise?.catch(() => {})
       const authToken = await this.authPromise
 
       return await requestWithRetry<T>({
@@ -501,27 +543,25 @@ export class RingRestClient {
     } catch (e: any) {
       const response = e.response || {}
 
-      if (response.status === 401) {
+      if (response.status === 401 && attempt <= 2) {
         await this.refreshAuth()
-        return this.request<T>(options)
+        return this.request<T>(options, attempt + 1)
       }
 
-      if (response.status === 504) {
-        await delay(5000)
-        return this.request<T>(options)
+      if (response.status === 504 && attempt <= 5) {
+        await delay(5000 * attempt)
+        return this.request<T>(options, attempt + 1)
       }
 
       if (response.status === 404 && url.startsWith(clientApiBaseUrl)) {
-        if (
-          response.body?.error?.includes(this.hardwareId)
-        ) {
+        if (response.body?.error?.includes(this.hardwareId) && attempt <= 2) {
           logError(
             'Session hardware_id not found. Creating a new session and trying again.',
           )
           if (this.sessionPromise === initialSessionPromise) {
             this.refreshSession()
           }
-          return this.request<T>(options)
+          return this.request<T>(options, attempt + 1)
         }
         throw new Error(
           'Not found with response: ' + stringify(response.body),

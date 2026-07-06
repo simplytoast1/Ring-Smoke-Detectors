@@ -2,8 +2,8 @@
   Homebridge Custom UI for Ring Smoke Detectors
 
   States:
-  1. Not authenticated — show "Log In" button and login form
-  2. Authenticated — auto-discover devices, show device list with
+  1. Not authenticated: show "Log In" button and login form
+  2. Authenticated: auto-discover devices, show device list with
      model info, custom names, and show/hide toggles
 -->
 <style>
@@ -180,6 +180,19 @@
     return deviceType;
   }
 
+  // Escape untrusted values before interpolating them into HTML. Device
+  // and location names come from the Ring account and may contain quotes
+  // or markup; unescaped they break the form or execute as script inside
+  // the Homebridge admin UI.
+  function escapeHtml(value) {
+    return String(value ?? '')
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#39;');
+  }
+
   function showStatus(message, type) {
     const el = document.getElementById('statusBar');
     el.className = 'status-bar ' + type;
@@ -319,16 +332,27 @@
         refreshToken: pluginConfig.refreshToken,
       });
 
+      // Authenticating consumed the stored token and Ring rotated it.
+      // Save the replacement immediately or the stored token is left dead.
+      if (response.refreshToken && response.refreshToken !== pluginConfig.refreshToken) {
+        pluginConfig.refreshToken = response.refreshToken;
+        await homebridge.updatePluginConfig([pluginConfig]);
+        await homebridge.savePluginConfig();
+      }
+
       discoveredDevices = response.devices || [];
       renderDeviceList(pluginConfig);
 
-      if (discoveredDevices.length === 0) {
+      const failed = response.failedLocations || [];
+      if (failed.length > 0) {
+        showStatus(`Found ${discoveredDevices.length} device(s), but some locations could not be reached: ${failed.join(', ')}. Check the Homebridge UI logs and try Refresh Devices.`, 'warning');
+      } else if (discoveredDevices.length === 0) {
         showStatus('No Kidde smoke detectors found. Make sure your devices are set up in the Ring app.', 'info');
       } else {
         showStatus(`Found ${discoveredDevices.length} device(s).`, 'success');
       }
     } catch (e) {
-      showStatus('Failed to discover devices. Check your connection and try again.', 'warning');
+      showStatus((e && e.message) ? `Failed to discover devices: ${e.message}` : 'Failed to discover devices. Check your connection and try again.', 'warning');
     } finally {
       homebridge.hideSpinner();
     }
@@ -357,27 +381,30 @@
 
     container.innerHTML = discoveredDevices.map(device => {
       const isVisible = !hiddenDevices.includes(device.zid);
-      const customName = deviceNames[device.zid] || '';
-      const model = getModelName(device.deviceType);
-      const battery = device.batteryLevel != null
-        ? ` &middot; Battery: ${device.batteryLevel}%`
+      const zid = escapeHtml(device.zid);
+      const name = escapeHtml(device.name);
+      const customName = escapeHtml(deviceNames[device.zid] || '');
+      const model = escapeHtml(getModelName(device.deviceType));
+      const location = escapeHtml(device.locationName);
+      const battery = typeof device.batteryLevel === 'number'
+        ? ` &middot; Battery: ${escapeHtml(device.batteryLevel)}%`
         : '';
 
       return `
-        <div class="device-card" data-zid="${device.zid}">
+        <div class="device-card" data-zid="${zid}">
           <div class="device-model">${model}${battery}</div>
           <input
             class="device-name-input"
             type="text"
-            placeholder="${device.name}"
+            placeholder="${name}"
             value="${customName}"
-            data-zid="${device.zid}"
-            data-original="${device.name}"
+            data-zid="${zid}"
+            data-original="${name}"
           />
-          <div class="device-location">${device.locationName}</div>
+          <div class="device-location">${location}</div>
           <div class="checkbox-row">
-            <input type="checkbox" id="cb-${device.zid}" ${isVisible ? 'checked' : ''} data-zid="${device.zid}" />
-            <label for="cb-${device.zid}">Show in HomeKit</label>
+            <input type="checkbox" id="cb-${zid}" ${isVisible ? 'checked' : ''} data-zid="${zid}" />
+            <label for="cb-${zid}">Show in HomeKit</label>
           </div>
         </div>
       `;

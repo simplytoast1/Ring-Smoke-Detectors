@@ -34,23 +34,35 @@ export abstract class BaseAccessory {
     protected readonly accessory: PlatformAccessory,
     protected readonly deviceData: BehaviorSubject<SmokeDetectorDeviceData>,
   ) {
-    const data = deviceData.value
-
     // Set the mandatory AccessoryInformation service.
     // This shows up in the HomeKit app's accessory details.
+    // Registered against the data stream (not set once) because the
+    // initial payload may lack serial/firmware info that a later
+    // device-list poll fills in.
     const infoService = accessory.getService(
       hap.Service.AccessoryInformation,
     )!
-    infoService
-      .setCharacteristic(hap.Characteristic.Manufacturer, 'Kidde')
-      .setCharacteristic(
-        hap.Characteristic.Model,
-        data.deviceType || 'Ring Smoke Detector',
-      )
-      .setCharacteristic(
-        hap.Characteristic.SerialNumber,
-        data.serialNumber || data.zid,
-      )
+
+    this.registerCharacteristic(
+      infoService,
+      hap.Characteristic.Manufacturer,
+      (data) => data.manufacturerName || 'Kidde',
+    )
+    this.registerCharacteristic(
+      infoService,
+      hap.Characteristic.Model,
+      (data) => data.deviceType || 'Ring Smoke Detector',
+    )
+    this.registerCharacteristic(
+      infoService,
+      hap.Characteristic.SerialNumber,
+      (data) => data.serialNumber || data.zid,
+    )
+    this.registerCharacteristic(
+      infoService,
+      hap.Characteristic.FirmwareRevision,
+      (data) => data.components?.['firmware-version']?.main || '1.0',
+    )
   }
 
   /**
@@ -114,8 +126,10 @@ export abstract class BaseAccessory {
     this.registerCharacteristic(
       battery,
       hap.Characteristic.StatusLowBattery,
+      // 'none' means no battery data (wired models), not an empty battery,
+      // so only 'low' should raise the HomeKit low-battery warning
       (data) =>
-        data.batteryStatus === 'low' || data.batteryStatus === 'none'
+        data.batteryStatus === 'low'
           ? hap.Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
           : hap.Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL,
     )
@@ -127,6 +141,39 @@ export abstract class BaseAccessory {
         data.batteryStatus === 'charging'
           ? hap.Characteristic.ChargingState.CHARGING
           : hap.Characteristic.ChargingState.NOT_CHARGING,
+    )
+  }
+
+  /**
+   * Surface device health on the primary sensor service:
+   * - StatusTampered: the physical tamper switch
+   * - StatusFault: device malfunctions, end-of-life sensors, AC power
+   *   failure on wired models, or an explicit faulted flag
+   *
+   * These states are already delivered over the WebSocket; without them a
+   * detector that can no longer detect anything looks perfectly healthy
+   * in HomeKit.
+   */
+  protected setupStatusCharacteristics(service: Service): void {
+    this.registerCharacteristic(
+      service,
+      hap.Characteristic.StatusTampered,
+      (data) =>
+        data.tamperStatus === 'tamper'
+          ? hap.Characteristic.StatusTampered.TAMPERED
+          : hap.Characteristic.StatusTampered.NOT_TAMPERED,
+    )
+
+    this.registerCharacteristic(
+      service,
+      hap.Characteristic.StatusFault,
+      (data) =>
+        data.faulted === true ||
+        (data.components?.malfunctions?.current?.length ?? 0) > 0 ||
+        data.components?.['alarm.end-of-life']?.alarmStatus === 'active' ||
+        data.acStatus === 'error'
+          ? hap.Characteristic.StatusFault.GENERAL_FAULT
+          : hap.Characteristic.StatusFault.NO_FAULT,
     )
   }
 
@@ -144,7 +191,9 @@ export abstract class BaseAccessory {
     // Always keep AccessoryInformation (required by HomeKit)
     keepSet.add(hap.Service.AccessoryInformation.UUID)
 
-    for (const service of this.accessory.services) {
+    // Iterate a copy: removeService mutates the live array, and removing
+    // while iterating skips the element after each removed one
+    for (const service of [...this.accessory.services]) {
       if (!keepSet.has(service.UUID)) {
         this.accessory.removeService(service)
       }
@@ -152,12 +201,27 @@ export abstract class BaseAccessory {
   }
 
   /**
-   * Update the device data with new state from the WebSocket.
+   * Merge new state from the WebSocket into the known device data.
    * This triggers all registered characteristic subscriptions to
    * re-evaluate and push updates to HomeKit if values changed.
+   *
+   * DataUpdate payloads are PARTIAL: they contain only the fields that
+   * changed. Replacing the whole state object with a partial update would
+   * flip an active smoke alarm back to "clear" and reset the battery to
+   * its default whenever an unrelated field updates. So we merge: shallow
+   * at the top level, one level deeper for the components map (a partial
+   * update may carry only the one component that changed).
    */
   updateData(data: SmokeDetectorDeviceData): void {
-    this.deviceData.next(data)
+    const previous = this.deviceData.value
+    this.deviceData.next({
+      ...previous,
+      ...data,
+      components: {
+        ...previous.components,
+        ...data.components,
+      },
+    })
   }
 
   /** Clean up RxJS subscriptions when the accessory is removed */

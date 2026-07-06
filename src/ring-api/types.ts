@@ -7,7 +7,7 @@
  * collection where hub-connected Z-wave sensors appear.
  *
  * CRITICAL: The REST API "other" collection provides only device metadata (name,
- * battery health, connection status) — it does NOT include real-time alarm state.
+ * battery health, connection status), but it does NOT include real-time alarm state.
  * Alarm state (smoke detected, CO detected, etc.) is ONLY available via the
  * WebSocket connection. This is why the WebSocket is essential, not optional.
  *
@@ -52,7 +52,7 @@ export type KiddeDeviceType =
 /**
  * Response from Ring's WebSocket ticket endpoint (clap/tickets).
  *
- * The ticket endpoint returns a list of "assets" — devices at the location
+ * The ticket endpoint returns a list of "assets": devices at the location
  * that support WebSocket communication. Each asset has a UUID that we use
  * to request its device list over the WebSocket.
  *
@@ -132,12 +132,12 @@ export interface SocketIoMessage {
  * }
  */
 export interface SmokeDetectorComponents {
-  /** Smoke alarm status — "active" means smoke detected */
+  /** Smoke alarm status: "active" means smoke detected */
   'alarm.smoke'?: {
     alarmStatus: 'active' | 'inactive'
     relayStatus?: string
   }
-  /** CO alarm status — "active" means dangerous CO levels */
+  /** CO alarm status: "active" means dangerous CO levels */
   'alarm.co'?: {
     alarmStatus: 'active' | 'inactive'
     relayStatus?: string
@@ -221,7 +221,7 @@ export interface SmokeDetectorDeviceData {
   /** Whether the device has a fault condition */
   faulted?: boolean
   tags?: string[]
-  /** Real-time alarm component states — THE PRIMARY DATA WE NEED */
+  /** Real-time alarm component states: THE PRIMARY DATA WE NEED */
   components?: SmokeDetectorComponents
   /**
    * Legacy flat alarm fields. Some firmware versions may include these
@@ -255,7 +255,7 @@ export function isKiddeAsset(asset: TicketAsset): boolean {
 
 /**
  * Check if a WebSocket deviceType is a Kidde smoke detector.
- * Used to filter devices discovered via WebSocket — we skip
+ * Used to filter devices discovered via WebSocket; we skip
  * security-panel devices (which Ring creates for monitored locations
  * but don't have burglar-alarm capability, causing HomeKit errors).
  */
@@ -282,16 +282,21 @@ export function isSmokeOnly(deviceType: string): boolean {
  *   { general: { v2: { zid, name, deviceType, ... } },
  *     device:  { v1: { components, batteryLevel, ... } } }
  *
- * We merge them via Object.assign() — this is the exact same approach
+ * We merge them via Object.assign(); this is the exact same approach
  * used by ring-client-api's Location class (flattenDeviceData function).
  */
-export function flattenDeviceData(data: {
-  general?: { v2?: Record<string, any> }
-  device?: { v1?: Record<string, any> }
-}): SmokeDetectorDeviceData {
+export function flattenDeviceData(
+  data:
+    | {
+        general?: { v2?: Record<string, any> }
+        device?: { v1?: Record<string, any> }
+      }
+    | null
+    | undefined,
+): SmokeDetectorDeviceData {
   return Object.assign(
     {},
-    data.general?.v2,
-    data.device?.v1,
+    data?.general?.v2,
+    data?.device?.v1,
   ) as SmokeDetectorDeviceData
 }

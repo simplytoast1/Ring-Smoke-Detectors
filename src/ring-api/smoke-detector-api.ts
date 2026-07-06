@@ -19,7 +19,7 @@
  * Therefore, our discovery approach is:
  * 1. Fetch ALL locations from the REST API
  * 2. For EVERY location, attempt a WebSocket connection (via clap/tickets)
- * 3. The clap/tickets endpoint returns "assets" — if any are sensor_bluejay_*,
+ * 3. The clap/tickets endpoint returns "assets"; if any are sensor_bluejay_*,
  *    that location has Kidde devices and we proceed with WebSocket discovery
  * 4. If no sensor_bluejay_* assets, we skip that location (no Kidde devices)
  *

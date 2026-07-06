@@ -14,7 +14,7 @@ export { clientApi, appApi, deviceApi }
 export { RingRestClient }
 
 export class RestClientWrapper {
-  /** The underlying RingRestClient — also used directly by SmokeDetectorWebSocket */
+  /** The underlying RingRestClient, also used directly by SmokeDetectorWebSocket */
   public readonly restClient: RingRestClient
 
   constructor(

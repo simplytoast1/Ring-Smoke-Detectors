@@ -8,7 +8,7 @@
  * - SmokeSensor: SmokeDetected characteristic
  * - Battery: BatteryLevel, StatusLowBattery, ChargingState
  *
- * Note: No CarbonMonoxideSensor service — these devices don't have CO sensors.
+ * Note: No CarbonMonoxideSensor service; these devices don't have CO sensors.
  */
 
 import type { PlatformAccessory } from 'homebridge'
@@ -32,15 +32,20 @@ export class SmokeDetectorAccessory extends BaseAccessory {
       hap.Characteristic.SmokeDetected,
       (data) => {
         // Check both the legacy flat field and the components structure
-        // for compatibility across firmware versions
-        const status =
-          data.smoke?.alarmStatus ??
-          data.components?.['alarm.smoke']?.alarmStatus
-        return status === 'active'
+        // for compatibility across firmware versions. "Active" in EITHER
+        // location wins; a stale 'inactive' in one shape must never mask
+        // a live alarm reported in the other.
+        const active =
+          data.smoke?.alarmStatus === 'active' ||
+          data.components?.['alarm.smoke']?.alarmStatus === 'active'
+        return active
           ? hap.Characteristic.SmokeDetected.SMOKE_DETECTED
           : hap.Characteristic.SmokeDetected.SMOKE_NOT_DETECTED
       },
     )
+
+    // Tamper and fault reporting on the primary service
+    this.setupStatusCharacteristics(smokeSensor)
 
     // Battery service
     this.setupBatteryService()
