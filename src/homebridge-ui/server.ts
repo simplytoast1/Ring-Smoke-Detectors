@@ -185,7 +185,9 @@ class RingSmokeDetectorsUiServer extends HomebridgePluginUiServer {
   /**
    * Connect to a Ring WebSocket, request device lists for each asset,
    * and return the discovered Kidde devices. Times out after 10 seconds.
-   * Offline assets never respond, so only online ones are awaited.
+   * Waits for every asset to respond (the timeout backstops any that
+   * don't); ticket status is not used to gate completion, because Ring
+   * does not reliably report it as 'online'.
    */
   private fetchDevicesFromWebSocket(
     wsUrl: string,
@@ -195,7 +197,6 @@ class RingSmokeDetectorsUiServer extends HomebridgePluginUiServer {
     return new Promise((resolve) => {
       const devices: DiscoveredDevice[] = []
       const respondedAssets = new Set<string>()
-      const onlineAssets = assets.filter((a) => a.status === 'online')
       let seq = 1
       let settled = false
 
@@ -254,8 +255,9 @@ class RingSmokeDetectorsUiServer extends HomebridgePluginUiServer {
             })
           }
 
-          // If all online assets have responded, we're done
-          if (onlineAssets.every((a) => respondedAssets.has(a.uuid))) {
+          // If all assets have responded, we're done (the 10s timeout
+          // backstops any that never answer)
+          if (assets.every((a) => respondedAssets.has(a.uuid))) {
             finish()
           }
         } catch {

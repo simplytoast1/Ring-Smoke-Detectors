@@ -86,7 +86,7 @@ const WATCHDOG_INTERVAL_MS = 30_000
  */
 const STALE_CONNECTION_MS = 180_000
 /** How long getDevices() waits before settling with whatever it has */
-const GET_DEVICES_TIMEOUT_MS = 45_000
+const GET_DEVICES_TIMEOUT_MS = 20_000
 
 /** Outcome of a connection attempt */
 export type ConnectResult = 'connected' | 'no-assets'
@@ -116,8 +116,10 @@ export class SmokeDetectorWebSocket {
 
   /**
    * Observable that emits the complete accumulated device list.
-   * Only emits once all ONLINE assets have responded to DeviceInfoDocGetList.
-   * Offline assets never answer, so requiring them would hang discovery.
+   * Emits once every asset has responded to DeviceInfoDocGetList. An asset
+   * that never answers is bounded by the timeout in getDevices() rather
+   * than by pre-filtering on ticket status (Ring's status is not a
+   * reliable predictor of whether an asset will respond).
    */
   public readonly onDevices: Observable<SmokeDetectorDeviceData[]>
 
@@ -134,15 +136,17 @@ export class SmokeDetectorWebSocket {
   }
 
   /**
-   * Whether every online asset has answered DeviceInfoDocGetList.
+   * Whether every asset has answered DeviceInfoDocGetList.
    * The platform uses this to decide if the device list is trustworthy
-   * enough to base stale-accessory removal on.
+   * enough to base stale-accessory removal on. If an asset timed out,
+   * this stays false and stale cleanup is skipped (the safe choice).
    */
   get isDeviceListComplete(): boolean {
-    const online = this.assets.filter((a) => a.status === 'online')
     return (
-      online.length > 0 &&
-      online.every((a) => this.receivedAssetDeviceLists.includes(a.uuid))
+      this.assets.length > 0 &&
+      this.assets.every((a) =>
+        this.receivedAssetDeviceLists.includes(a.uuid),
+      )
     )
   }
 
@@ -241,12 +245,15 @@ export class SmokeDetectorWebSocket {
         },
         [] as SmokeDetectorDeviceData[],
       ),
-      // Only emit once all ONLINE assets have responded. Offline assets
-      // never answer; waiting on them would block discovery forever.
+      // Emit once every asset has responded. A non-responding asset is
+      // bounded by the timeout in getDevices(), not by pre-filtering on
+      // ticket status: Ring does not reliably report status as 'online',
+      // and gating on it can complete discovery early with no devices
+      // (an empty online set makes every() vacuously true).
       filter(() =>
-        this.assets
-          .filter((a) => a.status === 'online')
-          .every((a) => this.receivedAssetDeviceLists.includes(a.uuid)),
+        this.assets.every((a) =>
+          this.receivedAssetDeviceLists.includes(a.uuid),
+        ),
       ),
       distinctUntilChanged((a, b) => JSON.stringify(a) === JSON.stringify(b)),
       shareReplay(1),
@@ -337,8 +344,12 @@ export class SmokeDetectorWebSocket {
 
     const offline = supportedAssets.filter((a) => a.status !== 'online')
     if (offline.length > 0) {
-      logWarn(
-        `Location "${this.locationName}": ${offline.length} asset(s) offline, they will be skipped for discovery: ` +
+      // Informational only. We still request device lists from these
+      // assets, because Ring's ticket status is often stale and the
+      // asset frequently responds anyway; the getDevices() timeout is
+      // the real backstop if one truly never answers.
+      logDebug(
+        `Location "${this.locationName}": ${offline.length} asset(s) report non-online ticket status; requesting their device lists anyway: ` +
           offline.map((a) => a.uuid).join(', '),
       )
     }
@@ -576,7 +587,7 @@ export class SmokeDetectorWebSocket {
   }
 
   /**
-   * Get the initial device list (waits for all online assets to respond).
+   * Get the initial device list (waits for all assets to respond).
    * If responses don't arrive within GET_DEVICES_TIMEOUT_MS, settles with
    * whatever has accumulated so far instead of hanging discovery forever.
    * Callers can check isDeviceListComplete to know which case occurred.
