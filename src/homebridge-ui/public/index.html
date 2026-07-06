@@ -166,6 +166,10 @@
   let currentEmail = '';
   let currentPassword = '';
   let discoveredDevices = [];
+  // Discovery authenticates and Ring rotates the refresh token. We hold the
+  // replacement here and persist it only when the user clicks Save, so the
+  // discovery/render path never blocks on a config write.
+  let rotatedRefreshToken = null;
 
   const modelNames = {
     'sensor_bluejay_wsc': 'Kidde Smart Smoke + CO Alarm (Wired)',
@@ -332,12 +336,12 @@
         refreshToken: pluginConfig.refreshToken,
       });
 
-      // Authenticating consumed the stored token and Ring rotated it.
-      // Save the replacement immediately or the stored token is left dead.
+      // Authenticating consumed the stored token and Ring rotated it. Hold
+      // the replacement (persisted on the next Save) rather than writing it
+      // here: a blocking savePluginConfig() in this path can hang and leave
+      // the spinner up forever.
       if (response.refreshToken && response.refreshToken !== pluginConfig.refreshToken) {
-        pluginConfig.refreshToken = response.refreshToken;
-        await homebridge.updatePluginConfig([pluginConfig]);
-        await homebridge.savePluginConfig();
+        rotatedRefreshToken = response.refreshToken;
       }
 
       discoveredDevices = response.devices || [];
@@ -437,6 +441,12 @@
 
     pluginConfig.hiddenDevices = hiddenDevices.length > 0 ? hiddenDevices : undefined;
     pluginConfig.deviceNames = Object.keys(deviceNames).length > 0 ? deviceNames : undefined;
+
+    // Persist the token Ring rotated to during discovery, if any, so the
+    // stored token stays valid
+    if (rotatedRefreshToken) {
+      pluginConfig.refreshToken = rotatedRefreshToken;
+    }
 
     await homebridge.updatePluginConfig([pluginConfig]);
     await homebridge.savePluginConfig();
