@@ -20,14 +20,15 @@ import type { PlatformAccessory } from 'homebridge'
 import { BehaviorSubject } from 'rxjs'
 import { hap } from '../hap.js'
 import type { SmokeDetectorDeviceData } from '../ring-api/types.js'
-import { BaseAccessory } from './base-accessory.js'
+import { BaseAccessory, type AvailabilitySource } from './base-accessory.js'
 
 export class SmokeCoDetectorAccessory extends BaseAccessory {
   constructor(
     accessory: PlatformAccessory,
     deviceData: BehaviorSubject<SmokeDetectorDeviceData>,
+    availability?: AvailabilitySource,
   ) {
-    super(accessory, deviceData)
+    super(accessory, deviceData, availability)
 
     // Smoke Sensor service, which triggers HomeKit smoke alerts
     const smokeSensor = this.getOrAddService(hap.Service.SmokeSensor)
@@ -73,7 +74,11 @@ export class SmokeCoDetectorAccessory extends BaseAccessory {
 
     // CO Level in PPM from the co.level component, clamped to the
     // characteristic's valid 0-100 range so an out-of-range reading
-    // can't be rejected by HAP
+    // can't be rejected by HAP.
+    //
+    // Unlike the battery level, a missing reading falls back to 0 rather
+    // than reporting unknown: 0 ppm is the normal state, and the actual
+    // safety signal is CarbonMonoxideDetected, which is reported separately.
     this.registerCharacteristic(
       coSensor,
       hap.Characteristic.CarbonMonoxideLevel,

@@ -26,7 +26,11 @@ Each detector exposes the following HomeKit services:
 
 - **Smoke Sensor**: alerts when smoke is detected (all models), plus tamper and fault status (device malfunction, end-of-life sensor, AC power failure)
 - **Carbon Monoxide Sensor**: alerts when CO is detected, with PPM level (CO models only)
-- **Battery**: battery level and low-battery warnings
+- **Battery**: low-battery warnings, plus an approximate level
+
+If the connection to Ring drops, the detectors show as **not responding** in the Home app until it is restored. That is deliberate: for a smoke detector, a silent "no smoke" from a dead connection is worse than an obvious "no response".
+
+Note on battery level: these detectors report a battery *category* (such as "full" or "low") rather than a percentage, so the level shown is an approximation of that category. If a detector reports a category the plugin does not recognize, the level shows as unknown rather than guessing a number, and the unrecognized value is logged so it can be added.
 
 ## Prerequisites
 
@@ -82,12 +86,14 @@ If you prefer, add this to your Homebridge `config.json` under `platforms`:
 ## How It Works
 
 1. **Authentication**: OAuth token management with automatic token rotation. Ring rotates the refresh token periodically, so the plugin writes each new token back into your `config.json` (the same approach the reference homebridge-ring plugin uses) to keep a valid token available across restarts. The settings page reads the plugin's discovered-device cache rather than logging in again, so opening settings never disturbs the running plugin's token.
-2. **Location Discovery**: Fetches all Ring locations, then probes each one via WebSocket. If a location can't be reached, the others still come up and the failed one is retried on its own schedule.
+2. **Location Discovery**: Fetches all Ring locations, then probes each one via WebSocket. If a location can't be reached, the others still come up and the failed one is retried on its own schedule. Locations are re-checked hourly, so a detector added later is picked up without restarting Homebridge.
 3. **WebSocket Connection**: Requests a ticket from Ring's `clap/tickets` endpoint and establishes a direct WebSocket connection, even without a Ring hub.
 4. **Device Discovery**: Sends `DeviceInfoDocGetList` requests over the WebSocket to discover devices and their current state.
 5. **Real-time Updates**: Subscribes to `DataUpdate` messages for live alarm state changes (smoke, CO, battery, etc.).
 6. **Keepalive**: Polls each detector's state once a minute. The poll doubles as a dead-connection detector: if nothing is received for three minutes, the connection is considered half-open and is re-established, so a silently broken connection can't suppress alarm delivery.
-7. **Auto-reconnect**: Reconnects with jittered exponential backoff (5s up to 60s) on connection loss, never gives up, and automatically picks up new devices on reconnect.
+7. **Auto-reconnect**: Reconnects with jittered exponential backoff (5s up to 60s) on connection loss, never gives up, and automatically picks up new devices on reconnect. While a connection is down the affected detectors report as not responding, and a dropped connection also re-checks authentication so a revoked login is reported clearly instead of retrying forever.
+
+Pressing the physical test button on a detector is detected and written to the Homebridge log. It is not exposed to HomeKit as a separate button.
 
 ## Troubleshooting
 

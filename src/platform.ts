@@ -62,6 +62,7 @@ import {
 } from './config.js'
 import { setLogger, logInfo, logWarn, logError, logDebug, delay } from './util.js'
 import { RestClientWrapper } from './ring-api/rest-client-wrapper.js'
+import { RingAuthError } from './ring-api/ring-rest-client.js'
 import { fetchAllLocations } from './ring-api/smoke-detector-api.js'
 import { SmokeDetectorWebSocket } from './ring-api/websocket-connection.js'
 import {
@@ -69,6 +70,7 @@ import {
   RingLocation,
   isKiddeDeviceType,
   isSmokeOnly,
+  IMPULSE_ALARM_TESTING,
 } from './ring-api/types.js'
 import {
   updateConfigRefreshToken,
@@ -78,7 +80,10 @@ import {
   CachedDevice,
   writeDeviceCache,
 } from './ring-api/device-cache.js'
-import { BaseAccessory } from './accessories/base-accessory.js'
+import {
+  BaseAccessory,
+  type AvailabilitySource,
+} from './accessories/base-accessory.js'
 import { SmokeCoDetectorAccessory } from './accessories/smoke-co-detector.js'
 import { SmokeDetectorAccessory } from './accessories/smoke-detector.js'
 
@@ -87,16 +92,22 @@ const INITIAL_RETRY_DELAY_MS = 30_000
 /** Cap for discovery/location retry backoff */
 const MAX_RETRY_DELAY_MS = 15 * 60_000
 
+/** How often to re-probe locations that have no live connection */
+const REDISCOVERY_INTERVAL_MS = 60 * 60_000
+
+/** Window in which repeated test-button signals collapse into one log line */
+const TEST_EVENT_DEDUPE_MS = 30_000
+
 /** Outcome of probing one location */
 type ProbeOutcome = 'ok' | 'partial' | 'failed'
 
-/** True when an error is a definitive auth rejection (not transient) */
+/**
+ * True when an error is a definitive auth rejection (not transient).
+ * The REST client raises a typed error for this, so there is no need to
+ * match on message text.
+ */
 function isAuthFailure(error: unknown): boolean {
-  const message = String(error)
-  return (
-    message.includes('Failed to fetch oauth token from Ring') ||
-    message.includes('Refresh token is not valid')
-  )
+  return error instanceof RingAuthError
 }
 
 export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
@@ -113,8 +124,30 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
    */
   private readonly activeAccessories = new Map<string, BaseAccessory>()
 
-  /** Active WebSocket connections (one per location with Kidde devices) */
-  private readonly connections: SmokeDetectorWebSocket[] = []
+  /**
+   * Active WebSocket connections, keyed by location id. A connection stays
+   * here while it reconnects internally, so rediscovery knows not to open a
+   * second socket for the same location.
+   */
+  private readonly connections = new Map<string, SmokeDetectorWebSocket>()
+
+  /** Location ids that could not be probed on the last pass */
+  private failedLocationIds = new Set<string>()
+
+  /** Device zids known per location, so connected locations stay accounted for */
+  private readonly locationDeviceIds = new Map<string, Set<string>>()
+
+  /** Guards against overlapping discovery passes */
+  private discoveryRunning = false
+
+  /** Periodic rediscovery timer */
+  private rediscoveryTimer: ReturnType<typeof setInterval> | null = null
+
+  /** zid to timestamp of the last logged test-button press (dedupe) */
+  private readonly lastTestEvent = new Map<string, number>()
+
+  /** When the last rediscovery pass started, for throttling */
+  private lastRediscoveryAt = 0
 
   /** Path to the Homebridge storage directory (for the device cache) */
   private readonly storagePath: string
@@ -150,15 +183,28 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
       logError(
         'No refresh token configured. Open the plugin settings in the Homebridge UI to log in.',
       )
+      // Accessories restored from cache would otherwise keep answering with
+      // last session's values, so a detector this plugin cannot reach would
+      // still read as "no smoke".
+      api.on('didFinishLaunching', () => {
+        this.markUnhandledAccessoriesUnavailable()
+      })
       return
     }
 
     // Wait for Homebridge to finish loading all plugins before we start
     // making network requests and creating accessories
     api.on('didFinishLaunching', () => {
+      // Homebridge restores cached characteristic VALUES but not their error
+      // state, so a restored detector answers HomeKit with the previous
+      // session's reading until a live handler takes over. Start them all in
+      // the not-responding state; discovery clears it as devices come up.
+      this.markUnhandledAccessoriesUnavailable()
+
       this.discoverDevices(pluginConfig).catch((error) => {
         logError(`Device discovery failed: ${error}`)
       })
+      this.startRediscovery(pluginConfig)
     })
 
     // Clean up WebSocket connections on Homebridge shutdown
@@ -214,6 +260,56 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
     }
   }
 
+  /**
+   * The shared REST client, created once and reused.
+   *
+   * Creating a second client would be actively harmful: Ring's refresh
+   * tokens are single-use, so two clients rotating in parallel double-spend
+   * one token and invalidate the other's. Existing websockets also hold a
+   * reference to this client, so it must outlive individual discovery runs.
+   */
+  private ensureClient(config: RingSmokeDetectorsConfig): RestClientWrapper {
+    if (this.client) return this.client
+
+    // Start from the freshest token in config.json, so a re-login is picked
+    // up without a restart.
+    const refreshToken = this.getStartToken(config)
+    this.client = new RestClientWrapper(refreshToken, (newToken, oldToken) => {
+      // Ring rotates refresh tokens periodically. Write the new token back
+      // into config.json so it survives restarts.
+      logInfo('Ring refresh token updated')
+      this.persistRefreshToken(newToken, oldToken)
+    })
+    return this.client
+  }
+
+  /**
+   * Drop the REST client so the next discovery attempt rebuilds it from the
+   * current config.json token. Used after a definitive auth rejection, which
+   * is the one case where the in-memory token chain is worth abandoning.
+   */
+  private resetClient(): void {
+    this.client?.restClient.clearTimeouts()
+    this.client = null
+
+    // Every live websocket captured the discarded client, so it can never
+    // authenticate again. Tear them down and forget the locations; the next
+    // discovery pass rebuilds them against the new client. Without this the
+    // locations stay in `connections`, are skipped by every future pass, and
+    // never recover even after the user re-authenticates.
+    for (const connection of this.connections.values()) {
+      connection.disconnect()
+    }
+    this.connections.clear()
+    this.locationDeviceIds.clear()
+    this.failedLocationIds.clear()
+    for (const handler of this.activeAccessories.values()) {
+      handler.destroy()
+    }
+    this.activeAccessories.clear()
+    this.markUnhandledAccessoriesUnavailable()
+  }
+
   // ─── Device Discovery ──────────────────────────────────────────────────
 
   /**
@@ -228,32 +324,103 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
   ): Promise<void> {
     let attempt = 0
 
-    while (!this.shuttingDown) {
-      try {
-        await this.runDiscovery(config)
-        return
-      } catch (error) {
-        if (this.shuttingDown) return
+    // Held for the WHOLE loop, including the backoff sleep. Releasing it
+    // during the sleep would let a rediscovery pass run concurrently, and
+    // because probeLocation only records a connection after connect()
+    // resolves, that yields two websockets for the same location.
+    this.discoveryRunning = true
+    try {
+      while (!this.shuttingDown) {
+        try {
+          await this.runDiscovery(config)
+          return
+        } catch (error) {
+          if (this.shuttingDown) return
 
-        if (isAuthFailure(error)) {
-          // The token was rejected. A re-login writes a new token to config,
-          // which the next attempt re-reads. Until then, keep retrying slowly.
-          logError(
-            'Ring authentication failed. Your session may have been revoked or the token expired. ' +
-              'Open the plugin settings and click Re-authenticate.',
+          if (isAuthFailure(error)) {
+            // The token was rejected. A re-login writes a new token to
+            // config; dropping the client makes the next attempt pick it up.
+            // Until then, keep retrying slowly.
+            logError(
+              'Ring authentication failed. Your session may have been revoked or the token expired. ' +
+                'Open the plugin settings and click Re-authenticate.',
+            )
+            this.resetClient()
+          }
+
+          // Discovery did not complete, so any cached accessory without a
+          // live handler is reporting stale state. Mark it unavailable.
+          this.markUnhandledAccessoriesUnavailable()
+
+          attempt++
+          const delayMs = Math.min(
+            INITIAL_RETRY_DELAY_MS * 2 ** (attempt - 1),
+            MAX_RETRY_DELAY_MS,
           )
+          logError(
+            `Device discovery failed: ${error}. Retrying in ${Math.round(delayMs / 1000)}s...`,
+          )
+          await delay(delayMs)
         }
-
-        attempt++
-        const delayMs = Math.min(
-          INITIAL_RETRY_DELAY_MS * 2 ** (attempt - 1),
-          MAX_RETRY_DELAY_MS,
-        )
-        logError(
-          `Device discovery failed: ${error}. Retrying in ${Math.round(delayMs / 1000)}s...`,
-        )
-        await delay(delayMs)
       }
+    } finally {
+      this.discoveryRunning = false
+    }
+  }
+
+  // ─── Rediscovery ───────────────────────────────────────────────────────
+
+  /**
+   * Periodically re-probe locations that have no live connection.
+   *
+   * This is how a detector added after startup gets picked up: a location
+   * that reported zero Kidde assets is not kept as a connection, so without
+   * a periodic re-probe its first detector would stay invisible until
+   * Homebridge restarted. It also retries locations that could not be
+   * reached, and the locations fetch re-exercises auth so a revoked token
+   * surfaces as an actionable message.
+   */
+  private startRediscovery(config: RingSmokeDetectorsConfig): void {
+    this.rediscoveryTimer = setInterval(() => {
+      void this.requestRediscovery(config, 'periodic check')
+    }, REDISCOVERY_INTERVAL_MS)
+  }
+
+  /**
+   * Run a discovery pass unless one is already in flight.
+   *
+   * throttleMs skips the pass if one ran recently, so a flapping connection
+   * cannot turn every drop into another round of Ring API calls.
+   */
+  private async requestRediscovery(
+    config: RingSmokeDetectorsConfig,
+    reason: string,
+    throttleMs = 0,
+  ): Promise<void> {
+    if (this.shuttingDown || this.discoveryRunning) return
+    if (
+      throttleMs > 0 &&
+      Date.now() - this.lastRediscoveryAt < throttleMs
+    ) {
+      return
+    }
+    this.lastRediscoveryAt = Date.now()
+    this.discoveryRunning = true
+    logDebug(`Running device rediscovery (${reason})`)
+    try {
+      await this.runDiscovery(config)
+    } catch (error) {
+      if (isAuthFailure(error)) {
+        logError(
+          'Ring authentication failed. Your session may have been revoked or the token expired. ' +
+            'Open the plugin settings and click Re-authenticate.',
+        )
+        this.resetClient()
+      } else {
+        logDebug(`Rediscovery failed: ${error}`)
+      }
+    } finally {
+      this.discoveryRunning = false
     }
   }
 
@@ -273,27 +440,16 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
   private async runDiscovery(
     config: RingSmokeDetectorsConfig,
   ): Promise<void> {
-    // Start from the freshest token in config.json (re-read each attempt so a
-    // re-login is picked up without a restart).
-    const refreshToken = this.getStartToken(config)
-
     // Track which devices this run sees, so a clean run can prune the cache
     this.cacheZidsThisRun = new Set()
 
-    // Replace any client left over from a failed previous run
-    this.client?.restClient.clearTimeouts()
-
-    // Create authenticated REST client (handles OAuth, token refresh, etc.).
-    this.client = new RestClientWrapper(refreshToken, (newToken, oldToken) => {
-      // Ring rotates refresh tokens periodically. Write the new token back
-      // into config.json so it survives restarts.
-      logInfo('Ring refresh token updated')
-      this.persistRefreshToken(newToken, oldToken)
-    })
+    const client = this.ensureClient(config)
 
     // Fetch ALL locations. We need to probe each one via WebSocket
     // because we can't tell from the REST API which ones have Kidde devices.
-    let locations = await fetchAllLocations(this.client)
+    // This call also exercises authentication, so a revoked token surfaces
+    // here as a RingAuthError even when every location is already connected.
+    let locations = await fetchAllLocations(client)
 
     // Allow users to limit which Ring locations this plugin manages
     if (config.locationIds?.length) {
@@ -310,9 +466,32 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
     const discoveredDeviceIds = new Set<string>()
     const failedLocations: RingLocation[] = []
     let cleanProbe = true
+    /** True only when every location was actually enumerated this pass */
+    let fullyProbed = true
 
     for (const location of locations) {
       if (this.shuttingDown) return
+
+      // Already connected (or reconnecting internally): leave the socket
+      // alone, but carry its known devices forward so they are not mistaken
+      // for removed ones. Treating this as "unclean" instead would make
+      // stale cleanup dead code after the first pass, since a connected
+      // location is never re-probed.
+      const existing = this.connections.get(location.location_id)
+      if (existing) {
+        const known = this.locationDeviceIds.get(location.location_id)
+        known?.forEach((zid) => discoveredDeviceIds.add(zid))
+        // This location's devices were not re-enumerated this pass, so the
+        // settings-UI cache has no fresh evidence for them and must not be
+        // pruned against this run.
+        fullyProbed = false
+        // Only trustworthy while the socket is actually up with a full list
+        if (!existing.connected || !existing.isDeviceListComplete) {
+          cleanProbe = false
+        }
+        continue
+      }
+
       const outcome = await this.probeLocation(
         location,
         config,
@@ -340,17 +519,28 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
     // list. A transient outage must never masquerade as a removed device.
     if (cleanProbe) {
       this.removeStaleAccessories(discoveredDeviceIds)
-      this.pruneDeviceCache()
+      // Pruning the settings-UI cache needs a pass that re-enumerated every
+      // location; otherwise skipped locations look like they have no devices
+      // and the whole cache gets emptied.
+      if (fullyProbed) this.pruneDeviceCache()
     } else {
       logWarn(
         'Skipping stale accessory cleanup: some locations could not be fully probed.',
       )
     }
 
-    // Locations that failed get their own retry schedule so a single
-    // unreachable location doesn't take the rest of the plugin down.
-    if (failedLocations.length > 0) {
-      this.scheduleLocationRetry(failedLocations, config, discoveredDeviceIds)
+    // Any accessory left without a live handler belongs to a location we
+    // could not reach, so it must not keep reporting its last known state.
+    this.markUnhandledAccessoriesUnavailable()
+
+    // Locations that failed get a faster retry than the hourly rediscovery,
+    // so a single unreachable location doesn't hold the plugin back.
+    const hadFailures = this.failedLocationIds.size > 0
+    this.failedLocationIds = new Set(
+      failedLocations.map((l) => l.location_id),
+    )
+    if (this.failedLocationIds.size > 0 && !hadFailures) {
+      this.scheduleLocationRetry(config)
     }
   }
 
@@ -372,7 +562,7 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
       const ws = new SmokeDetectorWebSocket(
         location.location_id,
         location.name,
-        this.client!.restClient,
+        this.ensureClient(config).restClient,
       )
 
       // connect() throws on failure (so we can tell "no devices" apart
@@ -385,10 +575,16 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
           `Location "${location.name}": no Kidde smoke detector assets found, skipping`,
         )
         ws.disconnect()
-        return 'ok'
+        // If THIS location previously had detectors, an empty asset list is
+        // far more likely to be transient (Ring hiccup, detectors rebooting)
+        // than the user having deleted them, so report an incomplete probe
+        // and leave the existing accessories alone. Judged per location: a
+        // location that genuinely has no Kidde devices must still count as a
+        // clean probe, or cleanup would never run again on that account.
+        return this.locationHadDevices(location.location_id) ? 'partial' : 'ok'
       }
 
-      this.connections.push(ws)
+      this.connections.set(location.location_id, ws)
 
       // Wait for the online assets to respond with their device data.
       // Bounded by a timeout inside getDevices() so one silent asset
@@ -405,8 +601,14 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
       this.updateDeviceCache(devices, location.name)
 
       // Create HomeKit accessories for each Kidde smoke/CO device
+      const known = new Set<string>()
+      this.locationDeviceIds.set(location.location_id, known)
       for (const device of devices) {
-        this.handleDiscoveredDevice(device, config, discoveredDeviceIds)
+        const before = discoveredDeviceIds.size
+        this.handleDiscoveredDevice(device, config, discoveredDeviceIds, ws)
+        // Record what this location owns (hidden/non-Kidde devices are
+        // skipped by handleDiscoveredDevice and stay out of both sets)
+        if (discoveredDeviceIds.size > before) known.add(device.zid)
       }
 
       // Subscribe to the full device list observable. It fires on every
@@ -418,12 +620,36 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
       ws.onDevices.subscribe({
         next: (updatedDevices) => {
           this.updateDeviceCache(updatedDevices, location.name)
+          // Keep the per-location zid set current. A device discovered here
+          // (rather than during the initial probe) must be recorded, or the
+          // next cleanup pass would treat it as removed, unregister it, and
+          // re-add it as a brand new accessory: the user would silently lose
+          // its room, name and automations, once an hour.
+          const knownNow =
+            this.locationDeviceIds.get(location.location_id) ??
+            new Set<string>()
+          this.locationDeviceIds.set(location.location_id, knownNow)
           for (const device of updatedDevices) {
             const existing = this.activeAccessories.get(device.zid)
             if (existing) {
+              knownNow.add(device.zid)
+              // Merge, never replace: this document is the websocket's own
+              // accumulation of poll responses and does not include alarm
+              // deltas from the DataUpdate channel, so replacing could clear
+              // an alarm that is still active.
               existing.updateData(device)
             } else {
-              this.handleDiscoveredDevice(device, config, discoveredDeviceIds)
+              const before = discoveredDeviceIds.size
+              this.handleDiscoveredDevice(
+                device,
+                config,
+                discoveredDeviceIds,
+                ws,
+                location.location_id,
+              )
+              // Only track devices that actually became accessories; hidden
+              // and non-Kidde devices are skipped and must stay untracked.
+              if (discoveredDeviceIds.size > before) knownNow.add(device.zid)
             }
           }
         },
@@ -443,7 +669,13 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
             logDebug(
               `Device update: ${updatedDevice.name} (${updatedDevice.zid})`,
             )
+            const previous = accessory.currentData
             accessory.updateData(updatedDevice)
+            this.checkTestSignals(
+              updatedDevice.zid,
+              previous,
+              accessory.currentData,
+            )
           }
         },
         error: (error) => {
@@ -451,8 +683,46 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
         },
       })
 
+      // One-shot events, such as the physical test button being pressed.
+      ws.onImpulse.subscribe({
+        next: ({ zid, impulseTypes }) => {
+          if (
+            impulseTypes.some((t) => t.startsWith(IMPULSE_ALARM_TESTING))
+          ) {
+            this.noteTestButton(zid, `impulse ${impulseTypes.join(', ')}`)
+          }
+        },
+        error: (error) => {
+          logError(`Impulse stream error for "${location.name}": ${error}`)
+        },
+      })
+
+      // A dropped connection can mean the token was revoked. The websocket
+      // retries on its own, but only a REST call re-exercises auth, so kick
+      // a discovery pass to surface an actionable message (and pick up a
+      // token a re-login may have written) instead of reconnecting forever.
+      ws.onConnected.subscribe({
+        next: (connected) => {
+          if (!connected && !this.shuttingDown) {
+            logWarn(
+              `Connection to "${location.name}" is down; its detectors report ` +
+                'as not responding in HomeKit until it is back.',
+            )
+            void this.requestRediscovery(config, 'connection lost', 60_000)
+          }
+        },
+      })
+
       return ws.isDeviceListComplete ? 'ok' : 'partial'
     } catch (error) {
+      // A definitive auth rejection is not a per-location problem: let it
+      // reach the caller so the client is rebuilt and the user gets the
+      // actionable re-authenticate message once, instead of every location
+      // silently failing and starting a doomed reconnect loop.
+      this.dropConnection(location.location_id)
+      if (isAuthFailure(error)) {
+        throw error
+      }
       logError(
         `Failed to connect to location "${location.name}": ${error}`,
       )
@@ -460,11 +730,47 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
     }
   }
 
+  /** Whether this location is known to have had detectors before */
+  private locationHadDevices(locationId: string): boolean {
+    if ((this.locationDeviceIds.get(locationId)?.size ?? 0) > 0) return true
+    for (const accessory of this.cachedAccessories.values()) {
+      if (accessory.context.locationId === locationId) return true
+    }
+    return false
+  }
+
+  /**
+   * Forget a location's connection so a later pass re-probes it. Used when a
+   * probe fails partway: leaving a half-built entry in `connections` would
+   * make every future rediscovery skip that location for good.
+   */
+  private dropConnection(locationId: string): void {
+    const ws = this.connections.get(locationId)
+    if (!ws) return
+    this.connections.delete(locationId)
+
+    // Tear down this location's accessory handlers too. disconnect()
+    // completes the connection subject without emitting false, so leaving
+    // the handlers in place would keep them reporting "available" (and
+    // therefore serving the last known reading) for a location we have
+    // given up on.
+    for (const zid of this.locationDeviceIds.get(locationId) ?? []) {
+      this.activeAccessories.get(zid)?.destroy()
+      this.activeAccessories.delete(zid)
+    }
+    this.locationDeviceIds.delete(locationId)
+
+    try {
+      ws.disconnect()
+    } catch {
+      // best effort
+    }
+    this.markUnhandledAccessoriesUnavailable()
+  }
+
   /** Re-probe unreachable locations with exponential backoff, forever. */
   private scheduleLocationRetry(
-    locations: RingLocation[],
     config: RingSmokeDetectorsConfig,
-    discoveredDeviceIds: Set<string>,
     attempt = 1,
   ): void {
     if (this.shuttingDown) return
@@ -474,30 +780,16 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
       MAX_RETRY_DELAY_MS,
     )
     logInfo(
-      `Retrying ${locations.length} unreachable location(s) in ${Math.round(delayMs / 1000)}s...`,
+      `Retrying ${this.failedLocationIds.size} unreachable location(s) in ${Math.round(delayMs / 1000)}s...`,
     )
 
     const timer = setTimeout(async () => {
       if (this.shuttingDown) return
-      const stillFailed: RingLocation[] = []
-      for (const location of locations) {
-        if (this.shuttingDown) return
-        const outcome = await this.probeLocation(
-          location,
-          config,
-          discoveredDeviceIds,
-        )
-        if (outcome === 'failed') {
-          stillFailed.push(location)
-        }
-      }
-      if (stillFailed.length > 0) {
-        this.scheduleLocationRetry(
-          stillFailed,
-          config,
-          discoveredDeviceIds,
-          attempt + 1,
-        )
+      // Route through the shared entry point so a retry can never run
+      // alongside a rediscovery pass and open a second socket per location.
+      await this.requestRediscovery(config, 'retrying unreachable locations')
+      if (!this.shuttingDown && this.failedLocationIds.size > 0) {
+        this.scheduleLocationRetry(config, attempt + 1)
       }
     }, delayMs)
     this.retryTimers.push(timer)
@@ -508,6 +800,17 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
    * account. Only called after a fully successful discovery run.
    */
   private removeStaleAccessories(discoveredDeviceIds: Set<string>): void {
+    // Floor guard: a run that found nothing is never trusted to mean "the
+    // user deleted every detector". Ring transiently reports an empty asset
+    // list (detectors rebooting after a power cut is the common case), and
+    // unregistering everything destroys the user's rooms and automations.
+    if (discoveredDeviceIds.size === 0 && this.cachedAccessories.size > 0) {
+      logWarn(
+        'Discovery returned no devices; keeping existing accessories rather than removing them.',
+      )
+      return
+    }
+
     for (const [uuid, accessory] of this.cachedAccessories) {
       const zid = accessory.context.zid as string | undefined
       if (zid && !discoveredDeviceIds.has(zid)) {
@@ -585,6 +888,8 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
     device: SmokeDetectorDeviceData,
     config: RingSmokeDetectorsConfig,
     discoveredDeviceIds: Set<string>,
+    availability?: AvailabilitySource,
+    locationId?: string,
   ): void {
     // Skip non-Kidde devices (e.g., security-panel devices that Ring creates
     // for monitored locations; they lack burglar-alarm capability and cause
@@ -609,7 +914,65 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
     const forAccessory = override ? { ...device, name: override } : device
 
     discoveredDeviceIds.add(device.zid)
-    this.setupAccessory(forAccessory)
+    this.setupAccessory(forAccessory, availability, locationId)
+  }
+
+  /**
+   * Note a test-button press, collapsing the several signals a single press
+   * can produce (an impulse plus component updates) into one log line.
+   */
+  private noteTestButton(zid: string, source: string): void {
+    const now = Date.now()
+    const last = this.lastTestEvent.get(zid)
+    if (last !== undefined && now - last < TEST_EVENT_DEDUPE_MS) return
+    this.lastTestEvent.set(zid, now)
+
+    const name =
+      this.activeAccessories.get(zid)?.currentData.name ?? 'unknown device'
+    logInfo(`Test button pressed on ${name} (${zid}) via ${source}`)
+  }
+
+  /**
+   * Detect a test-button press from component state changes.
+   *
+   * pushToTest is confirmed to idle at "inactive" on real hardware; the
+   * active value has never been captured publicly, so any other status
+   * counts as a test press.
+   */
+  private checkTestSignals(
+    zid: string,
+    previous: SmokeDetectorDeviceData,
+    current: SmokeDetectorDeviceData,
+  ): void {
+    const before = previous.components?.pushToTest?.status
+    const after = current.components?.pushToTest?.status
+    if (after !== undefined && after !== 'inactive' && after !== before) {
+      this.noteTestButton(zid, `pushToTest status "${after}"`)
+    }
+  }
+
+  /**
+   * Mark cached accessories that have no live handler as not responding.
+   *
+   * Without this, an accessory restored from cache when discovery never
+   * succeeded keeps serving its last stored characteristic values, so a
+   * detector the plugin cannot reach still reads as "no smoke".
+   */
+  private markUnhandledAccessoriesUnavailable(): void {
+    for (const accessory of this.cachedAccessories.values()) {
+      const zid = accessory.context.zid as string | undefined
+      if (zid && this.activeAccessories.has(zid)) continue
+
+      for (const service of accessory.services) {
+        if (service.UUID === hap.Service.AccessoryInformation.UUID) continue
+        for (const characteristic of service.characteristics) {
+          if (characteristic.UUID === hap.Characteristic.Name.UUID) continue
+          characteristic.updateValue(
+            new Error('Ring connection unavailable for this detector'),
+          )
+        }
+      }
+    }
   }
 
   // ─── Accessory Management ──────────────────────────────────────────────
@@ -622,7 +985,11 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
    * - sensor_bluejay_wsc maps to SmokeCoDetectorAccessory (smoke + CO)
    * - sensor_bluejay_sc  maps to SmokeCoDetectorAccessory (smoke + CO, battery)
    */
-  private setupAccessory(device: SmokeDetectorDeviceData): void {
+  private setupAccessory(
+    device: SmokeDetectorDeviceData,
+    availability?: AvailabilitySource,
+    locationId?: string,
+  ): void {
     // Generate a stable UUID from the device's zid (unique identifier)
     const uuid = this.api.hap.uuid.generate(device.zid)
     const displayName = device.name || 'Smoke Detector'
@@ -655,9 +1022,13 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
       this.cachedAccessories.set(uuid, accessory)
     }
 
-    // Store device info in the accessory context for cache restoration
+    // Store device info in the accessory context for cache restoration.
+    // locationId lets a later run tell which location an accessory belongs
+    // to, so an empty result at one location cannot be judged using
+    // accessories that live somewhere else.
     accessory.context.zid = device.zid
     accessory.context.deviceType = device.deviceType
+    if (locationId) accessory.context.locationId = locationId
 
     // Create a BehaviorSubject with the initial device data.
     // The WebSocket will push updates to this subject via updateData().
@@ -666,9 +1037,9 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
     // Choose the right accessory type based on whether the device has a CO sensor
     let handler: BaseAccessory
     if (isSmokeOnly(device.deviceType)) {
-      handler = new SmokeDetectorAccessory(accessory, deviceData)
+      handler = new SmokeDetectorAccessory(accessory, deviceData, availability)
     } else {
-      handler = new SmokeCoDetectorAccessory(accessory, deviceData)
+      handler = new SmokeCoDetectorAccessory(accessory, deviceData, availability)
     }
 
     // Clean up any previous handler for this device (e.g., on reconnect)
@@ -689,13 +1060,17 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
       clearTimeout(timer)
     }
     this.retryTimers.length = 0
-    for (const connection of this.connections) {
+    if (this.rediscoveryTimer) {
+      clearInterval(this.rediscoveryTimer)
+      this.rediscoveryTimer = null
+    }
+    for (const connection of this.connections.values()) {
       connection.disconnect()
     }
     for (const accessory of this.activeAccessories.values()) {
       accessory.destroy()
     }
-    this.connections.length = 0
+    this.connections.clear()
     this.activeAccessories.clear()
     this.client?.restClient.clearTimeouts()
   }

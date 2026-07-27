@@ -15,14 +15,15 @@ import type { PlatformAccessory } from 'homebridge'
 import { BehaviorSubject } from 'rxjs'
 import { hap } from '../hap.js'
 import type { SmokeDetectorDeviceData } from '../ring-api/types.js'
-import { BaseAccessory } from './base-accessory.js'
+import { BaseAccessory, type AvailabilitySource } from './base-accessory.js'
 
 export class SmokeDetectorAccessory extends BaseAccessory {
   constructor(
     accessory: PlatformAccessory,
     deviceData: BehaviorSubject<SmokeDetectorDeviceData>,
+    availability?: AvailabilitySource,
   ) {
-    super(accessory, deviceData)
+    super(accessory, deviceData, availability)
 
     // Smoke Sensor service only (no CO for this device type)
     const smokeSensor = this.getOrAddService(hap.Service.SmokeSensor)

@@ -294,9 +294,64 @@ export function flattenDeviceData(
     | null
     | undefined,
 ): SmokeDetectorDeviceData {
-  return Object.assign(
-    {},
-    data?.general?.v2,
-    data?.device?.v1,
-  ) as SmokeDetectorDeviceData
+  // Only merge sections that are actually objects. Object.assign would
+  // happily spread a string into indexed characters, so an unexpected
+  // payload shape must not reach the accessory layer.
+  const result: Record<string, any> = {}
+  const general = data?.general?.v2
+  if (isPlainObject(general)) Object.assign(result, general)
+  const device = data?.device?.v1
+  if (isPlainObject(device)) Object.assign(result, device)
+  return result as SmokeDetectorDeviceData
+}
+
+function isPlainObject(value: unknown): value is Record<string, any> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * Extract impulse event types from a raw WebSocket body entry.
+ *
+ * Impulses are one-shot events (such as the physical test button) that
+ * arrive alongside the general/device sections:
+ *   { impulse: { v1: [ { impulseType: "alarm.testing" }, ... ] } }
+ *
+ * flattenDeviceData drops this section, so it has to be read from the raw
+ * body before flattening.
+ */
+export function extractImpulses(data: unknown): string[] {
+  if (!isPlainObject(data)) return []
+  const impulse = data.impulse
+  if (!isPlainObject(impulse)) return []
+  const v1 = impulse.v1
+  if (!Array.isArray(v1)) return []
+  return v1
+    .filter(
+      (entry): entry is { impulseType: string } =>
+        isPlainObject(entry) && typeof entry.impulseType === 'string',
+    )
+    .map((entry) => entry.impulseType)
+}
+
+/** Impulse type Ring sends when the physical test button is pressed */
+export const IMPULSE_ALARM_TESTING = 'alarm.testing'
+
+/**
+ * Approximate battery percentages for the categorical battery status these
+ * detectors report.
+ *
+ * The devices report a category (for example "full" or "low"), NOT a numeric
+ * percentage. The enum values come from ring-client-api's type union; only
+ * "full" has been observed on real hardware so far. HomeKit's Battery service
+ * wants a number, so each category maps to an approximate percentage. An
+ * unrecognized or missing status reports no value at all rather than a
+ * fabricated one.
+ */
+export const BATTERY_STATUS_PERCENT: Record<string, number> = {
+  full: 100,
+  charged: 100,
+  charging: 100,
+  ok: 75,
+  low: 20,
+  none: 0,
 }

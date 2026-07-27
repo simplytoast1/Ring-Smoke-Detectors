@@ -44,6 +44,22 @@ export function appApi(path: string): string {
   return appApiBaseUrl + path
 }
 
+// ─── Error Types ─────────────────────────────────────────────────────────────
+//
+// Callers need to tell "Ring definitively rejected our credentials" (only a
+// fresh login fixes it) apart from "Ring is having a moment" (retrying with
+// the same token will work). Matching on error message text is fragile, so
+// the distinction is carried by the error class.
+
+/** Generic Ring API failure (network trouble, server errors). Retryable. */
+export class RingApiError extends Error {}
+
+/** Ring definitively rejected the credentials or refresh token. */
+export class RingAuthError extends RingApiError {}
+
+/** Ring wants a 2FA verification code before it will issue a token. */
+export class Ring2FARequired extends RingAuthError {}
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 interface AuthConfig {
@@ -128,6 +144,13 @@ interface RequestOptions {
 
 /** Max retry attempts for network-level failures (no HTTP response at all) */
 const MAX_NETWORK_RETRIES = 5
+
+/**
+ * Longest rate-limit wait we honor, in seconds. Ring can return very large
+ * retry-after values; sleeping that long would stall discovery, so cap it and
+ * let the caller's own retry loop handle a longer outage.
+ */
+const MAX_RATE_LIMIT_WAIT_S = 60
 
 /**
  * Make an HTTP request with automatic retry on network failures.
@@ -220,6 +243,8 @@ export class RingRestClient {
   private _authPromise: Promise<OAuthResponse> | undefined
   private sessionPromise: Promise<unknown> | undefined
   private timeouts: ReturnType<typeof setTimeout>[] = []
+  /** Set by clearTimeouts(); stops a discarded client resurrecting itself */
+  private destroyed = false
   private readonly authOptions: AuthOptions
   private readonly baseSessionMetadata: Record<string, unknown>
 
@@ -304,7 +329,7 @@ export class RingRestClient {
         username: this.authOptions.email,
       }
     }
-    throw new Error(
+    throw new RingAuthError(
       'Refresh token is not valid. Unable to authenticate with Ring servers.',
     )
   }
@@ -397,7 +422,7 @@ export class RingRestClient {
 
         if (response.status === 400) {
           this.promptFor2fa = 'Invalid code entered. Please try again.'
-          throw new Error(responseError)
+          throw new Ring2FARequired(responseError)
         }
 
         if ('tsv_state' in responseData) {
@@ -412,7 +437,7 @@ export class RingRestClient {
             'Please enter the code sent to your text/email'
         }
 
-        throw new Error(
+        throw new Ring2FARequired(
           'Your Ring account is configured to use 2-factor authentication.',
         )
       }
@@ -431,7 +456,7 @@ export class RingRestClient {
         ` (error: ${responseError})`
 
       logError(errorMessage)
-      throw new Error(errorMessage)
+      throw new RingAuthError(errorMessage)
     }
   }
 
@@ -440,8 +465,22 @@ export class RingRestClient {
     return this.authPromise
   }
 
-  private async refreshAuth(): Promise<void> {
-    this._authPromise = undefined
+  /**
+   * Force a fresh token exchange, replacing the given stale attempt.
+   *
+   * Ring's refresh tokens are effectively single-use, so two concurrent
+   * exchanges of the same token would double-spend it: whichever Ring
+   * processes second is a reuse of an already-rotated token, which fails and
+   * can invalidate the whole chain. The compare-and-swap makes concurrent
+   * 401 handlers share ONE exchange: only the caller whose attempt is still
+   * the cached one invalidates it; the others simply await the replacement.
+   */
+  private async refreshAuth(
+    staleAuth?: Promise<OAuthResponse>,
+  ): Promise<void> {
+    if (!staleAuth || this._authPromise === staleAuth) {
+      this._authPromise = undefined
+    }
     await this.authPromise
   }
 
@@ -470,29 +509,49 @@ export class RingRestClient {
     })
   }
 
-  private getSession(): Promise<unknown> {
-    return this.authPromise.then(async (authToken) => {
+  private getSession(attempt = 1): Promise<unknown> {
+    // Capture the exact auth attempt used, so a 401 only invalidates that one
+    // and cannot clobber a fresh exchange another caller already started.
+    const authAttempt = this.authPromise
+    return authAttempt.then(async (authToken) => {
       try {
         return await this.fetchNewSession(authToken)
       } catch (e: any) {
         const response = e.response || {}
-        if (response.status === 401) {
-          await this.refreshAuth()
-          return this.getSession()
+        if (response.status === 401 && attempt <= 2) {
+          await this.refreshAuth(authAttempt)
+          return this.getSession(attempt + 1)
         }
         if (response.status === 429) {
+          // Bounded: the wait is capped AND the attempts are counted. Capping
+          // the wait without bounding the retries would turn a long server
+          // backoff into a 61-second hammer loop, and because every request
+          // awaits this session promise, it would never settle.
+          if (attempt > 3) {
+            throw new RingApiError(
+              'Ring rate limited the session request repeatedly; giving up for now',
+            )
+          }
           // headers.get() returns null when the header is absent, and
           // parseInt(null) is NaN, so guard on the PARSED value. The old
           // isNaN(null) check was false, which produced delay(NaN), i.e.
           // an instant zero-delay retry loop against a rate limiter.
+          //
+          // Ring can also send very large retry-after values when it rate
+          // limits an account; honoring those verbatim would stall discovery
+          // for hours, so the wait is capped and the caller's own retry loop
+          // owns any longer wait.
           const retryAfter = e.response.headers.get('retry-after')
           const parsed = Number.parseInt(retryAfter ?? '', 10)
-          const waitSeconds = Number.isNaN(parsed) ? 200 : parsed
+          const waitSeconds = Math.min(
+            Number.isNaN(parsed) ? MAX_RATE_LIMIT_WAIT_S : parsed,
+            MAX_RATE_LIMIT_WAIT_S,
+          )
           logError(
             `Session response rate limited. Waiting to retry after ${waitSeconds} seconds`,
           )
           await delay((waitSeconds + 1) * 1000)
-          return this.getSession()
+          return this.getSession(attempt + 1)
         }
         throw e
       }
@@ -500,6 +559,7 @@ export class RingRestClient {
   }
 
   refreshSession(): void {
+    if (this.destroyed) return
     this.sessionPromise = this.getSession()
     this.sessionPromise
       .finally(() => {
@@ -526,13 +586,16 @@ export class RingRestClient {
   async request<T>(options: { url: string }, attempt = 1): Promise<T> {
     const { url } = options
     const initialSessionPromise = this.sessionPromise
+    let authAttempt: Promise<OAuthResponse> | undefined
 
     try {
       // A failed session should not brick every request: proceed with the
       // bearer token and let the hardware_id-not-found path below recover
       // the session if an endpoint genuinely requires one.
       await initialSessionPromise?.catch(() => {})
-      const authToken = await this.authPromise
+      // Capture the exact auth attempt so a 401 replaces only this one
+      authAttempt = this.authPromise
+      const authToken = await authAttempt
 
       return await requestWithRetry<T>({
         ...options,
@@ -546,7 +609,7 @@ export class RingRestClient {
       const response = e.response || {}
 
       if (response.status === 401 && attempt <= 2) {
-        await this.refreshAuth()
+        await this.refreshAuth(authAttempt)
         return this.request<T>(options, attempt + 1)
       }
 
@@ -580,8 +643,18 @@ export class RingRestClient {
     }
   }
 
-  /** Clean up timers on shutdown */
+  /**
+   * Clean up timers and retire this client.
+   *
+   * The retirement flag matters: the session refresh reschedules itself from
+   * a `.finally()`, so a session request still in flight when this is called
+   * would otherwise arm a fresh 12-hour timer on a client that has already
+   * been discarded. That zombie would later re-authenticate with a stale
+   * refresh token and could overwrite the good token in config.json.
+   */
   clearTimeouts(): void {
+    this.destroyed = true
     this.timeouts.forEach(clearTimeout)
+    this.timeouts = []
   }
 }

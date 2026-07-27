@@ -69,6 +69,7 @@ import {
   SmokeDetectorDeviceData,
   isKiddeAsset,
   flattenDeviceData,
+  extractImpulses,
 } from './types.js'
 import { logInfo, logWarn, logError, logDebug, delay } from '../util.js'
 
@@ -99,10 +100,28 @@ export class SmokeDetectorWebSocket {
   private onMessage = new Subject<SocketIoMessage>()
   private onDataUpdate = new Subject<SocketIoMessage>()
   private onConnectedSubject = new BehaviorSubject<boolean>(false)
+  private onImpulseSubject = new Subject<{
+    zid: string
+    impulseTypes: string[]
+  }>()
 
   /** Observable that emits true/false when connection status changes */
   public readonly onConnected: Observable<boolean> =
     this.onConnectedSubject.asObservable()
+
+  /**
+   * One-shot device events (such as a physical test button press) that arrive
+   * in the raw message body's impulse section, which flattening discards.
+   */
+  public readonly onImpulse: Observable<{
+    zid: string
+    impulseTypes: string[]
+  }> = this.onImpulseSubject.asObservable()
+
+  /** Whether the websocket is currently established (synchronous check) */
+  get connected(): boolean {
+    return this.onConnectedSubject.value
+  }
 
   /**
    * Observable that emits individual device data updates in real-time.
@@ -115,11 +134,13 @@ export class SmokeDetectorWebSocket {
   public readonly onDeviceDataUpdate: Observable<SmokeDetectorDeviceData>
 
   /**
-   * Observable that emits the complete accumulated device list.
-   * Emits once every asset has responded to DeviceInfoDocGetList. An asset
-   * that never answers is bounded by the timeout in getDevices() rather
-   * than by pre-filtering on ticket status (Ring's status is not a
-   * reliable predictor of whether an asset will respond).
+   * Observable of the accumulated device list, emitted on every change.
+   *
+   * It deliberately does NOT wait for all assets: each detector is its own
+   * asset, so an all-or-nothing gate would let one silent detector suppress
+   * state re-sync for every other detector at the location. Callers that
+   * need a complete list (initial discovery) use getDevices(), which waits
+   * for completeness with a timeout.
    */
   public readonly onDevices: Observable<SmokeDetectorDeviceData[]>
 
@@ -158,12 +179,24 @@ export class SmokeDetectorWebSocket {
   private seq = 1
   private socket: WebSocket | null = null
   private reconnecting = false
+  /**
+   * Set whenever a reconnect is requested, including while a reconnect loop
+   * is already running, so a drop that happens inside that loop's own
+   * discovery window is not lost (the loop re-checks before declaring
+   * success).
+   */
+  private reconnectRequested = false
   private disconnected = false
   private consecutiveFailures = 0
   /** True once an initial connect() found assets and opened a socket */
   private initialConnectDone = false
   /** Timestamp of the last message received (for the watchdog) */
   private lastMessageAt = 0
+  /**
+   * True between a socket opening and the first device document arriving.
+   * Availability is only announced once fresh state is in hand.
+   */
+  private awaitingFirstDocument = false
   private pollTimer: ReturnType<typeof setInterval> | null = null
   private watchdogTimer: ReturnType<typeof setInterval> | null = null
 
@@ -199,10 +232,8 @@ export class SmokeDetectorWebSocket {
      * Initial device discovery pipeline:
      * Accumulates device lists from DeviceInfoDocGetList responses.
      * We may have multiple assets (one per physical detector), each
-     * returning its own device list. We merge them into a single array
-     * and only emit once all online assets have responded.
-     *
-     * This mirrors the onDevices observable in ring-client-api's Location class.
+     * returning its own device list, merged into a single array and emitted
+     * on every change. getDevices() owns the wait-for-completeness step.
      */
     const onDeviceList = this.onMessage.pipe(
       filter((m) => m.msg === 'DeviceInfoDocGetList'),
@@ -216,7 +247,12 @@ export class SmokeDetectorWebSocket {
           message: SocketIoMessage,
         ) => {
           const { body: deviceList, src } = message
-          if (!Array.isArray(deviceList)) return devices
+          // An empty body is not a usable answer, so it must not count as
+          // this asset having reported: treating it as complete would let a
+          // zero-device result look like an authoritative "nothing here".
+          if (!Array.isArray(deviceList) || deviceList.length === 0) {
+            return devices
+          }
 
           // Track that this asset has responded
           if (!this.receivedAssetDeviceLists.includes(src)) {
@@ -245,17 +281,27 @@ export class SmokeDetectorWebSocket {
         },
         [] as SmokeDetectorDeviceData[],
       ),
-      // Emit once every asset has responded. A non-responding asset is
-      // bounded by the timeout in getDevices(), not by pre-filtering on
-      // ticket status: Ring does not reliably report status as 'online',
-      // and gating on it can complete discovery early with no devices
-      // (an empty online set makes every() vacuously true).
-      filter(() =>
-        this.assets.every((a) =>
-          this.receivedAssetDeviceLists.includes(a.uuid),
-        ),
+      // Emit on every accumulated change rather than only once every asset
+      // has answered. Each detector is its own asset, so an all-or-nothing
+      // gate would let one silent detector permanently suppress the state
+      // re-sync (and new-device detection) for every other detector at the
+      // location. getDevices() owns the wait-for-completeness behavior.
+      //
+      // The responded-asset count is part of the distinctness key: two assets
+      // can report the same device, so the response that COMPLETES the list
+      // may be byte-identical to the previous emission. Comparing devices
+      // alone would swallow it and leave getDevices() waiting for a value
+      // that never comes.
+      map((devices) => ({
+        devices,
+        responded: this.receivedAssetDeviceLists.length,
+      })),
+      distinctUntilChanged(
+        (a, b) =>
+          a.responded === b.responded &&
+          JSON.stringify(a.devices) === JSON.stringify(b.devices),
       ),
-      distinctUntilChanged((a, b) => JSON.stringify(a) === JSON.stringify(b)),
+      map(({ devices }) => devices),
       shareReplay(1),
     )
   }
@@ -274,11 +320,18 @@ export class SmokeDetectorWebSocket {
    * internally with reconnect(); connect() is not meant to be called again.
    */
   async connect(): Promise<ConnectResult> {
-    const result = await this.doConnect()
-    if (result === 'connected') {
-      this.initialConnectDone = true
+    try {
+      const result = await this.doConnect()
+      if (result === 'connected') {
+        this.initialConnectDone = true
+      }
+      return result
+    } catch (error) {
+      // Clean up a partially established connection so no open socket or
+      // keepalive timer outlives a failed connect.
+      this.teardownSocket()
+      throw error
     }
-    return result
   }
 
   /**
@@ -403,17 +456,32 @@ export class SmokeDetectorWebSocket {
       return 'no-assets'
     }
 
-    this.onConnectedSubject.next(true)
-    this.consecutiveFailures = 0
+    // Backoff is NOT reset here. A socket that opens and is immediately
+    // dropped would otherwise keep resetting the counter and retry every 5s
+    // forever; the counter is cleared in announceAvailable(), once the
+    // connection has proved itself by delivering data.
+    //
+    // Availability is NOT announced yet either. An open socket does not mean the
+    // device state is known: it is announced once the first device document
+    // for this connection arrives, so HomeKit never sees pre-outage values
+    // presented as current.
+    this.awaitingFirstDocument = true
     logInfo(`WebSocket connected for location "${this.locationName}"`)
 
     // Step 5: Set up ongoing message handling for the lifetime of the connection.
+    //
+    // Every listener is bound to THIS socket and ignores events once the
+    // socket has been replaced or torn down. Without that guard, closing a
+    // socket during teardown fires its own close handler, which re-arms the
+    // reconnect request the loop just cleared, producing an endless
+    // connect/teardown flap.
     //
     // Messages arrive as JSON with structure: { msg: SocketIoMessage, channel: string }
     // - Initial device list responses come with msg.msg === 'DeviceInfoDocGetList'
     // - Real-time state updates come on channel === 'DataUpdate'
     // - HubDisconnectionEventType means the server wants us to reconnect
     socket.addEventListener('message', (event) => {
+      if (socket !== this.socket) return
       this.lastMessageAt = Date.now()
       try {
         const parsed = JSON.parse(String(event.data))
@@ -434,24 +502,38 @@ export class SmokeDetectorWebSocket {
         // Route to the onMessage subject (for device list accumulation)
         this.onMessage.next(message)
 
+        // Fresh device state has arrived, so this connection can now be
+        // treated as available for reporting to HomeKit.
+        if (message.msg === 'DeviceInfoDocGetList') {
+          this.announceAvailable()
+        }
+
         // Real-time state updates (alarm triggered, battery changed, etc.)
         // come on the "DataUpdate" channel. These are what drive HomeKit
         // characteristic updates for smoke/CO detection.
         if (channel === 'DataUpdate') {
+          // Also fresh state. Announcing here matters: if a connection only
+          // ever delivered DataUpdates and never answered the device-list
+          // request, availability would stay false and a genuine alarm
+          // arriving on this channel would be suppressed as "No Response".
+          this.announceAvailable()
           this.onDataUpdate.next(message)
+          this.emitImpulses(message)
         }
       } catch (error) {
         logDebug(`Failed to parse websocket message: ${error}`)
       }
     })
 
-    // Auto-reconnect on connection loss
+    // Auto-reconnect on connection loss (ignored for a superseded socket)
     socket.addEventListener('close', () => {
+      if (socket !== this.socket) return
       logDebug(`WebSocket closed for location "${this.locationName}"`)
       this.reconnect()
     })
 
     socket.addEventListener('error', () => {
+      if (socket !== this.socket) return
       logDebug(`WebSocket error for location "${this.locationName}"`)
       this.reconnect()
     })
@@ -465,6 +547,28 @@ export class SmokeDetectorWebSocket {
 
     this.startKeepalive()
     return 'connected'
+  }
+
+  /**
+   * Emit any one-shot impulse events carried by a DataUpdate message.
+   *
+   * Impulses live in the raw body's impulse section, which flattening drops,
+   * so they are read here before the flattening pipeline sees the message.
+   */
+  private emitImpulses(message: SocketIoMessage): void {
+    if (!Array.isArray(message.body)) return
+    for (const entry of message.body) {
+      const impulseTypes = extractImpulses(entry)
+      if (impulseTypes.length === 0) continue
+      const { zid } = flattenDeviceData(entry)
+      if (!zid) continue
+      // No public capture of a real test-button press exists yet, so keep the
+      // raw payload available at debug level to pin the enums down later.
+      logDebug(
+        `Impulse(s) ${impulseTypes.join(', ')} for device ${zid}: ${JSON.stringify(entry)}`,
+      )
+      this.onImpulseSubject.next({ zid, impulseTypes })
+    }
   }
 
   // ─── Keepalive / Watchdog ─────────────────────────────────────────────
@@ -515,50 +619,119 @@ export class SmokeDetectorWebSocket {
   // ─── Reconnection ─────────────────────────────────────────────────────
 
   /**
+   * Announce that this connection is serving fresh state. Called once the
+   * first data of a connection arrives, so availability never flips true
+   * while only pre-outage values are known.
+   */
+  private announceAvailable(): void {
+    if (!this.awaitingFirstDocument || this.disconnected) return
+    this.awaitingFirstDocument = false
+    // The connection has proved itself, so the backoff can start over
+    this.consecutiveFailures = 0
+    if (!this.onConnectedSubject.value) {
+      this.onConnectedSubject.next(true)
+    }
+  }
+
+  /**
+   * Whether the socket is genuinely usable right now. The connected flag
+   * alone can be stale: the socket can die while a reconnect attempt is
+   * still inside its own discovery window.
+   */
+  private isLive(): boolean {
+    return (
+      !this.disconnected &&
+      this.socket !== null &&
+      this.socket.readyState === WebSocket.OPEN
+    )
+  }
+
+  /** Close the current socket and stop its timers, without ending the object. */
+  private teardownSocket(): void {
+    this.stopKeepalive()
+    const socket = this.socket
+    // Detach first: the listeners compare against this.socket, so clearing it
+    // before close() means the close event this teardown causes is ignored
+    // instead of re-arming a reconnect request.
+    this.socket = null
+    this.awaitingFirstDocument = false
+    try {
+      socket?.close()
+    } catch {
+      // ignore close errors during cleanup
+    }
+    if (this.onConnectedSubject.value) {
+      this.onConnectedSubject.next(false)
+    }
+  }
+
+  /**
+   * Request a reconnect, starting the retry loop if one isn't already running.
+   *
+   * The request flag is set even when a loop is running so a drop occurring
+   * during that loop's own discovery window is not lost; the loop re-checks
+   * the flag before declaring success.
+   */
+  private reconnect(): void {
+    if (this.disconnected) return
+    this.reconnectRequested = true
+    if (this.reconnecting) return
+    this.reconnecting = true
+    void this.reconnectLoop().finally(() => {
+      this.reconnecting = false
+    })
+  }
+
+  /**
    * Reconnect with jittered exponential backoff.
    * Starts at 5s, doubles each attempt, caps at 60s, and NEVER gives up:
    * for a smoke detector integration, a plugin that quietly stops trying
    * is worse than one that retries once a minute forever.
    */
-  private async reconnect(): Promise<void> {
-    if (this.reconnecting || this.disconnected) return
-    this.reconnecting = true
-    this.stopKeepalive()
-    this.onConnectedSubject.next(false)
+  private async reconnectLoop(): Promise<void> {
+    while (!this.disconnected) {
+      this.reconnectRequested = false
+      this.teardownSocket()
+      if (this.disconnected) return
 
-    try {
-      this.socket?.close()
-    } catch {
-      // ignore close errors during cleanup
-    }
-    this.socket = null
+      this.consecutiveFailures++
+      const baseDelay = Math.min(
+        INITIAL_RECONNECT_DELAY_MS * Math.pow(2, this.consecutiveFailures - 1),
+        MAX_RECONNECT_DELAY_MS,
+      )
+      // +-20% jitter so multiple locations don't stampede Ring in sync
+      const delayMs = Math.round(baseDelay * (0.8 + Math.random() * 0.4))
 
-    this.consecutiveFailures++
-    const baseDelay = Math.min(
-      INITIAL_RECONNECT_DELAY_MS * Math.pow(2, this.consecutiveFailures - 1),
-      MAX_RECONNECT_DELAY_MS,
-    )
-    // +-20% jitter so multiple locations don't stampede Ring in sync
-    const delayMs = Math.round(baseDelay * (0.8 + Math.random() * 0.4))
+      logInfo(
+        `Reconnecting websocket for "${this.locationName}" in ${Math.round(delayMs / 1000)}s (attempt ${this.consecutiveFailures})...`,
+      )
 
-    logInfo(
-      `Reconnecting websocket for "${this.locationName}" in ${Math.round(delayMs / 1000)}s (attempt ${this.consecutiveFailures})...`,
-    )
+      await delay(delayMs)
+      if (this.disconnected) return
 
-    await delay(delayMs)
-    this.reconnecting = false
-
-    if (this.disconnected) return
-
-    try {
-      const result = await this.doConnect()
-      if (result === 'no-assets' && !this.disconnected) {
-        // Transient empty asset list during reconnect: keep trying
-        this.reconnect()
+      let result: ConnectResult
+      try {
+        result = await this.doConnect()
+      } catch (error) {
+        logError(`Reconnect failed for "${this.locationName}": ${error}`)
+        continue
       }
-    } catch (error) {
-      logError(`Reconnect failed for "${this.locationName}": ${error}`)
-      this.reconnect()
+
+      if (result === 'no-assets') {
+        // Transient empty asset list during reconnect: keep trying rather
+        // than silently ending monitoring for this location.
+        continue
+      }
+
+      if (!this.isLive() || this.reconnectRequested) {
+        // The socket dropped again during the discovery window.
+        logWarn(
+          `Reconnect for "${this.locationName}" did not come up cleanly, retrying`,
+        )
+        continue
+      }
+
+      return
     }
   }
 
@@ -595,12 +768,17 @@ export class SmokeDetectorWebSocket {
   async getDevices(): Promise<SmokeDetectorDeviceData[]> {
     return firstValueFrom(
       this.onDevices.pipe(
+        // Wait for a complete picture, but never indefinitely
+        filter(() => this.isDeviceListComplete),
         timeout({ first: GET_DEVICES_TIMEOUT_MS }),
         catchError(() => {
           logWarn(
             `Timed out waiting for device list at location "${this.locationName}" ` +
               `(${this.receivedAssetDeviceLists.length}/${this.assets.length} asset(s) responded)`,
           )
+          // Some assets stayed silent. Report what did arrive so those
+          // detectors still work, and let availability reflect reality.
+          if (this.latestDevices.length > 0) this.announceAvailable()
           return of(this.latestDevices)
         }),
       ),
@@ -611,12 +789,24 @@ export class SmokeDetectorWebSocket {
   disconnect(): void {
     this.disconnected = true
     this.stopKeepalive()
+    this.onImpulseSubject.complete()
+
+    // Same ordering invariant as teardownSocket(): detach before closing so
+    // the resulting close event cannot re-enter the reconnect logic.
+    const socket = this.socket
+    this.socket = null
+    this.awaitingFirstDocument = false
     try {
-      this.socket?.close()
+      socket?.close()
     } catch {
       // ignore
     }
-    this.socket = null
+
+    // Report unavailable before completing, so any accessory still bound to
+    // this connection stops presenting its last reading as current.
+    if (this.onConnectedSubject.value) {
+      this.onConnectedSubject.next(false)
+    }
     this.onMessage.complete()
     this.onDataUpdate.complete()
     this.onConnectedSubject.complete()
