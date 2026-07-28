@@ -381,9 +381,11 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
    * surfaces as an actionable message.
    */
   private startRediscovery(config: RingSmokeDetectorsConfig): void {
+    // unref: background work must never hold the child bridge open on exit
     this.rediscoveryTimer = setInterval(() => {
       void this.requestRediscovery(config, 'periodic check')
     }, REDISCOVERY_INTERVAL_MS)
+    this.rediscoveryTimer.unref()
   }
 
   /**
@@ -792,6 +794,7 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
         this.scheduleLocationRetry(config, attempt + 1)
       }
     }, delayMs)
+    timer.unref()
     this.retryTimers.push(timer)
   }
 

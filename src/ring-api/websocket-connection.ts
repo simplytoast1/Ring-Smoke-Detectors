@@ -589,11 +589,13 @@ export class SmokeDetectorWebSocket {
     this.stopKeepalive()
     this.lastMessageAt = Date.now()
 
+    // unref: keepalive must never hold the process open during shutdown
     this.pollTimer = setInterval(() => {
       for (const asset of this.assets) {
         this.requestList('DeviceInfoDocGetList', asset.uuid)
       }
     }, POLL_INTERVAL_MS)
+    this.pollTimer.unref()
 
     this.watchdogTimer = setInterval(() => {
       if (Date.now() - this.lastMessageAt > STALE_CONNECTION_MS) {
@@ -603,6 +605,7 @@ export class SmokeDetectorWebSocket {
         this.reconnect()
       }
     }, WATCHDOG_INTERVAL_MS)
+    this.watchdogTimer.unref()
   }
 
   private stopKeepalive(): void {

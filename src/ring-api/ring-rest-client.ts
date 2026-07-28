@@ -300,6 +300,8 @@ export class RingRestClient {
             },
             ((expires_in || 3600) - 60) * 1000,
           )
+          // unref: an hour-long token timer must not hold the process open
+          timeout.unref()
           this.timeouts.push(timeout)
         })
         .catch(() => {
@@ -563,11 +565,14 @@ export class RingRestClient {
     this.sessionPromise = this.getSession()
     this.sessionPromise
       .finally(() => {
-        // Refresh the session every 12 hours to keep it alive
+        // Refresh the session every 12 hours to keep it alive.
+        // unref: a 12-hour timer would otherwise keep the child bridge
+        // process alive long after Homebridge asked it to shut down.
         const timeout = setTimeout(
           () => this.refreshSession(),
           12 * 60 * 60 * 1000,
         )
+        timeout.unref()
         this.timeouts.push(timeout)
       })
       .catch((e) => logError(e))

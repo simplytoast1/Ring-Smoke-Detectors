@@ -362,7 +362,7 @@
         showStatus(`Found ${discoveredDevices.length} device(s), but some locations could not be reached: ${failed.join(', ')}. Check the Homebridge UI logs and try again.`, 'warning');
       } else if (discoveredDevices.length === 0) {
         showStatus(response.cacheEmpty
-          ? 'No devices discovered by the plugin yet. Log in above, or start/restart Homebridge so the plugin can scan Ring.'
+          ? 'No devices cached by the plugin yet. Click Refresh Devices to scan Ring now.'
           : 'No Kidde smoke detectors found. Make sure your devices are set up in the Ring app.', 'info');
       } else {
         showStatus(`Found ${discoveredDevices.length} device(s)${response.fromCache ? ' (from plugin).' : '.'}`, 'success');
@@ -381,10 +381,12 @@
       homebridge.toast.error('Not authenticated.');
       return;
     }
-    // Re-read the plugin's cache (kept fresh by the plugin's ~60s polling).
-    // This does NOT authenticate, so it can't disturb the running plugin.
-    showStatus('Refreshing devices...', 'success');
-    await loadDevices(pluginConfig, false);
+    // Explicit user action, so do a real scan of Ring rather than only
+    // re-reading the plugin's cache. Opening the settings page still uses
+    // the cache (and never authenticates); this button is the escape hatch
+    // for when the plugin has not cached anything yet.
+    showStatus('Scanning Ring for devices...', 'success');
+    await loadDevices(pluginConfig, true);
   }
 
   function renderDeviceList(pluginConfig) {
