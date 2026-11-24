@@ -121,6 +121,18 @@ function parseAuthConfig(rawRefreshToken?: string): AuthConfig | undefined {
   }
 }
 
+/** True when a token response actually carries both tokens as strings */
+function isUsableOAuthResponse(response: unknown): response is OAuthResponse {
+  if (typeof response !== 'object' || response === null) return false
+  const { access_token, refresh_token } = response as Record<string, unknown>
+  return (
+    typeof access_token === 'string' &&
+    access_token.length > 0 &&
+    typeof refresh_token === 'string' &&
+    refresh_token.length > 0
+  )
+}
+
 /**
  * Generate a hardware ID. Ring uses this to identify the "device" making
  * API requests. We use crypto.randomUUID(); no need for the systeminformation
@@ -343,8 +355,9 @@ export class RingRestClient {
   async getAuth(twoFactorAuthCode?: string): Promise<OAuthResponse> {
     const grantData = this.getGrantData(twoFactorAuthCode)
 
+    let response: OAuthResponse
     try {
-      const response = await requestWithRetry<OAuthResponse>({
+      response = await requestWithRetry<OAuthResponse>({
         url: 'https://oauth.ring.com/oauth/token',
         json: {
           client_id: 'ring_official_android',
@@ -359,27 +372,6 @@ export class RingRestClient {
           'User-Agent': 'android:com.ringapp',
         },
       })
-
-      const oldRefreshToken = this.refreshToken
-
-      // Store the new auth config with the rotated token and hardware ID
-      this.authConfig = {
-        ...this.authConfig,
-        rt: response.refresh_token,
-        hid: this.hardwareId,
-      }
-      this.refreshToken = toBase64(JSON.stringify(this.authConfig))
-
-      // Notify listeners so the new token can be persisted
-      this.onRefreshTokenUpdated.next({
-        oldRefreshToken,
-        newRefreshToken: this.refreshToken,
-      })
-
-      return {
-        ...response,
-        refresh_token: this.refreshToken,
-      }
     } catch (requestError: any) {
       if (grantData.refresh_token) {
         const status = requestError.response?.status
@@ -459,6 +451,41 @@ export class RingRestClient {
 
       logError(errorMessage)
       throw new RingAuthError(errorMessage)
+    }
+
+    // A 200 is not proof of a usable token. requestWithRetry hands back the
+    // raw text when the body is not JSON, and Ring (or anything in between)
+    // can answer 200 with a body that has no tokens in it. Accepting that
+    // would build a "refresh token" with no token inside and persist it over
+    // the good one in config.json. Treat it as a transient failure instead:
+    // keep the current credentials and let the caller's retry try again.
+    if (!isUsableOAuthResponse(response)) {
+      const message =
+        'Ring returned an unexpected response to the token request. ' +
+        'Keeping the current refresh token and retrying later.'
+      logError(message)
+      throw new RingApiError(message)
+    }
+
+    const oldRefreshToken = this.refreshToken
+
+    // Store the new auth config with the rotated token and hardware ID
+    this.authConfig = {
+      ...this.authConfig,
+      rt: response.refresh_token,
+      hid: this.hardwareId,
+    }
+    this.refreshToken = toBase64(JSON.stringify(this.authConfig))
+
+    // Notify listeners so the new token can be persisted
+    this.onRefreshTokenUpdated.next({
+      oldRefreshToken,
+      newRefreshToken: this.refreshToken,
+    })
+
+    return {
+      ...response,
+      refresh_token: this.refreshToken,
     }
   }
 

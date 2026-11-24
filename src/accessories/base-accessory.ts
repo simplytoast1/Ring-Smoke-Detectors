@@ -13,11 +13,13 @@
  * 2. Push updates: When the WebSocket delivers new device data, the RxJS
  *    pipeline automatically pushes the new value to HomeKit via updateValue()
  *
- * AVAILABILITY: sensor characteristics are tied to the location's WebSocket
- * connection. While that connection is down, they report an error so HomeKit
- * shows "No Response" instead of the last known state. Without this, a dead
- * connection is indistinguishable from "no smoke", which is the worst
- * possible failure mode for a life-safety sensor.
+ * AVAILABILITY: sensor characteristics are tied to whether THIS detector is
+ * currently reporting (the platform passes a per-detector source). While it
+ * is not, because the connection is down or because this one detector has
+ * gone silent, they report an error so HomeKit shows "No Response" instead
+ * of the last known state. Without this, a detector we cannot hear from is
+ * indistinguishable from "no smoke", which is the worst possible failure
+ * mode for a life-safety sensor.
  */
 
 import type {
@@ -30,28 +32,69 @@ import type {
 import { BehaviorSubject, Observable, Subscription, combineLatest, of } from 'rxjs'
 import { map, distinctUntilChanged } from 'rxjs/operators'
 import { hap } from '../hap.js'
-import { logWarn } from '../util.js'
+import { logInfo, logWarn, logDebug } from '../util.js'
 import {
   BATTERY_STATUS_PERCENT,
+  BATTERY_STATUS_NO_DATA,
+  DEFAULT_LOW_BATTERY_THRESHOLD,
   type SmokeDetectorDeviceData,
 } from '../ring-api/types.js'
 
 /**
- * Connection health for the location serving this accessory. The WebSocket
- * class satisfies this shape.
+ * Whether the detector behind this accessory is currently reporting.
+ * SmokeDetectorWebSocket.availabilityFor(zid) provides one per detector.
  */
 export interface AvailabilitySource {
   readonly connected: boolean
   readonly onConnected: Observable<boolean>
 }
 
-/** Thrown from characteristic reads while the Ring connection is down. */
-const UNAVAILABLE_ERROR = () =>
-  new Error('Ring connection unavailable for this detector')
+/** Per-accessory settings taken from the plugin config */
+export interface AccessoryOptions {
+  /**
+   * Numeric battery level (percent) at or below which HomeKit shows the
+   * low-battery warning. Only matters for firmware that reports a number;
+   * the categorical "low" status always raises the warning.
+   */
+  lowBatteryThreshold?: number
+}
 
-/** Battery/alarm status spellings already warned about, to avoid log spam */
+/**
+ * Raised from characteristic reads while this detector is not reporting.
+ *
+ * A HapStatusError, not a plain Error: HAP-NodeJS treats a plain Error from
+ * a read handler as a plugin bug and logs a warning with a stack trace for
+ * every single read, which floods the log for the whole length of an outage.
+ * The status error produces the same "No Response" in HomeKit, quietly.
+ */
+const UNAVAILABLE_ERROR = () =>
+  new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE)
+
+/** Status spellings already warned about, to avoid log spam */
 const warnedBatteryStatus = new Set<string>()
 const warnedAlarmStatus = new Set<string>()
+const warnedCommStatus = new Set<string>()
+
+/**
+ * Every battery- or power-related field Ring reported for a device, for the
+ * debug log. These detectors are only known to report a battery CATEGORY, so
+ * this is how a numeric level (or any other useful field) would be noticed
+ * on real hardware.
+ */
+function batterySnapshot(data: SmokeDetectorDeviceData): Record<string, unknown> {
+  const interesting = /batt|power|^acStatus$/i
+  const snapshot: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(data)) {
+    if (interesting.test(key)) snapshot[key] = value
+  }
+  const components = data.components
+  if (isMergeableObject(components)) {
+    for (const [key, value] of Object.entries(components)) {
+      if (interesting.test(key)) snapshot[`components.${key}`] = value
+    }
+  }
+  return snapshot
+}
 
 function isMergeableObject(value: unknown): value is Record<string, any> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -73,15 +116,35 @@ export abstract class BaseAccessory {
   /** Emits the current availability of this accessory's connection */
   private readonly available$: Observable<boolean>
 
-  /** Last battery percentage we could actually determine */
+  /**
+   * Last battery percentage we could actually determine. Starts at 100
+   * because HomeKit's BatteryLevel has no "unknown" value: until the
+   * detector reports something we can map, the level is a placeholder and
+   * the low-battery warning (which never guesses) is the signal that counts.
+   */
   private lastKnownBatteryPercent = 100
+
+  /** Numeric level at or below which the low-battery warning is raised */
+  private readonly lowBatteryThreshold: number
 
   constructor(
     protected readonly accessory: PlatformAccessory,
     protected readonly deviceData: BehaviorSubject<SmokeDetectorDeviceData>,
     private readonly availability?: AvailabilitySource,
+    options: AccessoryOptions = {},
   ) {
     this.available$ = availability ? availability.onConnected : of(true)
+
+    const threshold = options.lowBatteryThreshold
+    this.lowBatteryThreshold =
+      typeof threshold === 'number' && threshold >= 0 && threshold <= 100
+        ? threshold
+        : DEFAULT_LOW_BATTERY_THRESHOLD
+
+    const initial = deviceData.value
+    logDebug(
+      `Battery data reported for "${initial.name || initial.zid}": ${JSON.stringify(batterySnapshot(initial))}`,
+    )
 
     // Set the mandatory AccessoryInformation service.
     // This shows up in the HomeKit app's accessory details.
@@ -126,7 +189,7 @@ export abstract class BaseAccessory {
     return this.deviceData.value
   }
 
-  /** Whether the Ring connection serving this accessory is up */
+  /** Whether this detector is currently reporting */
   protected get isAvailable(): boolean {
     return this.availability ? this.availability.connected : true
   }
@@ -179,13 +242,24 @@ export abstract class BaseAccessory {
 
     // Push updates reactively when device data or availability changes.
     // distinctUntilChanged() prevents redundant HomeKit updates.
+    //
+    // getValue runs on raw data from Ring. If it ever throws, the value is
+    // treated as unknown: an exception here would otherwise end this stream
+    // for good and surface as an uncaught exception.
+    const safeValue = (data: SmokeDetectorDeviceData) => {
+      try {
+        return getValue(data)
+      } catch {
+        return undefined
+      }
+    }
     const source = gated
       ? combineLatest([this.deviceData, this.available$]).pipe(
           map(([data, available]) =>
-            available ? getValue(data) : undefined,
+            available ? safeValue(data) : undefined,
           ),
         )
-      : this.deviceData.pipe(map(getValue))
+      : this.deviceData.pipe(map(safeValue))
 
     const sub = source
       .pipe(distinctUntilChanged())
@@ -205,9 +279,14 @@ export abstract class BaseAccessory {
    *
    * These detectors report a categorical batteryStatus ("full", "low", ...),
    * not a numeric percentage, so the level is an approximation of that
-   * category. An unrecognized or missing status reports no value at all
-   * rather than a fabricated one: claiming 100% on a detector whose battery
-   * state is actually unknown is exactly the wrong direction to guess in.
+   * category. A numeric batteryLevel is used instead whenever the firmware
+   * does report one.
+   *
+   * HomeKit's BatteryLevel cannot express "unknown", so an unrecognized or
+   * missing status holds the last level that could be determined. The
+   * low-battery warning is the part to trust: it is raised only on real
+   * evidence (the "low" category, or a numeric level at or below the
+   * configured threshold) and never from a placeholder.
    */
   protected setupBatteryService(): void {
     const battery = this.getOrAddService(hap.Service.Battery)
@@ -223,24 +302,59 @@ export abstract class BaseAccessory {
       (data) => this.batteryPercent(data) ?? this.lastKnownBatteryPercent,
     )
 
-    this.registerCharacteristic(
-      battery,
-      hap.Characteristic.StatusLowBattery,
-      // 'none' means no battery data (wired models), not an empty battery,
-      // so only 'low' should raise the HomeKit low-battery warning
-      (data) =>
-        data.batteryStatus === 'low'
-          ? hap.Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
-          : hap.Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL,
-    )
+    this.registerLowBattery(battery)
 
+    // These detectors run on replaceable or sealed cells, so the honest
+    // default is "not chargeable" rather than "not charging". The charging
+    // spellings are still honored in case some firmware reports them.
     this.registerCharacteristic(
       battery,
       hap.Characteristic.ChargingState,
+      (data) => {
+        if (data.batteryStatus === 'charging') {
+          return hap.Characteristic.ChargingState.CHARGING
+        }
+        if (data.batteryStatus === 'charged') {
+          return hap.Characteristic.ChargingState.NOT_CHARGING
+        }
+        return hap.Characteristic.ChargingState.NOT_CHARGEABLE
+      },
+    )
+  }
+
+  /**
+   * Bind the low-battery warning to a service.
+   *
+   * Registered on the Battery service and on each sensor service, so the
+   * warning shows on the sensor tile itself and not only in the accessory's
+   * battery details.
+   */
+  protected registerLowBattery(service: Service): void {
+    this.registerCharacteristic(
+      service,
+      hap.Characteristic.StatusLowBattery,
       (data) =>
-        data.batteryStatus === 'charging'
-          ? hap.Characteristic.ChargingState.CHARGING
-          : hap.Characteristic.ChargingState.NOT_CHARGING,
+        this.isLowBattery(data)
+          ? hap.Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
+          : hap.Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL,
+    )
+  }
+
+  /**
+   * Whether the battery needs attention.
+   *
+   * The categorical "low" always counts. A numeric level also counts when
+   * it is at or below the configured threshold, so firmware that reports a
+   * percentage raises the warning even if its category has not caught up.
+   * 'none' means no battery data, not an empty battery, and never counts.
+   */
+  private isLowBattery(data: SmokeDetectorDeviceData): boolean {
+    if (data.batteryStatus === 'low') return true
+    const level = data.batteryLevel
+    return (
+      typeof level === 'number' &&
+      Number.isFinite(level) &&
+      level <= this.lowBatteryThreshold
     )
   }
 
@@ -265,14 +379,17 @@ export abstract class BaseAccessory {
     }
 
     const status = data.batteryStatus
-    if (status === undefined) return undefined
+    // No status, or the explicit "no battery data" status: nothing to map
+    if (status === undefined || status === BATTERY_STATUS_NO_DATA) {
+      return undefined
+    }
 
     const percent = BATTERY_STATUS_PERCENT[status]
     if (percent === undefined) {
       if (!warnedBatteryStatus.has(status)) {
         warnedBatteryStatus.add(status)
         logWarn(
-          `Unrecognized batteryStatus "${status}"; reporting battery level as unknown. ` +
+          `Unrecognized batteryStatus "${status}"; keeping the last known battery level. ` +
             'Please report this value on the issue tracker so it can be mapped.',
         )
       }
@@ -308,7 +425,11 @@ export abstract class BaseAccessory {
         data.faulted === true ||
         (data.components?.malfunctions?.current?.length ?? 0) > 0 ||
         data.components?.['alarm.end-of-life']?.alarmStatus === 'active' ||
-        data.acStatus === 'error'
+        data.acStatus === 'error' ||
+        // Ring's own view of whether it can reach the detector. Only the
+        // confirmed unhealthy value raises a fault; other spellings are
+        // logged by instrumentUnknownStates so they can be mapped.
+        data.commStatus === 'error'
           ? hap.Characteristic.StatusFault.GENERAL_FAULT
           : hap.Characteristic.StatusFault.NO_FAULT,
     )
@@ -364,7 +485,35 @@ export abstract class BaseAccessory {
       co: mergeObject(previous.co, data.co),
     }
     this.instrumentUnknownStates(merged)
+    this.logBatteryChange(previous, merged)
     this.deviceData.next(merged)
+  }
+
+  /**
+   * Log battery transitions. They are rare and worth seeing: this is how a
+   * "full" to "low" change (or a firmware that starts reporting a numeric
+   * level) shows up in the Homebridge log.
+   */
+  private logBatteryChange(
+    previous: SmokeDetectorDeviceData,
+    current: SmokeDetectorDeviceData,
+  ): void {
+    if (
+      previous.batteryStatus === current.batteryStatus &&
+      previous.batteryLevel === current.batteryLevel
+    ) {
+      return
+    }
+    const describe = (d: SmokeDetectorDeviceData) =>
+      [
+        d.batteryStatus ?? 'no status',
+        typeof d.batteryLevel === 'number' ? `${d.batteryLevel}%` : undefined,
+      ]
+        .filter(Boolean)
+        .join(', ')
+    logInfo(
+      `Battery for "${current.name || current.zid}" changed: ${describe(previous)} -> ${describe(current)}`,
+    )
   }
 
   // NOTE: there is deliberately no "replace wholesale" entry point.
@@ -422,6 +571,20 @@ export abstract class BaseAccessory {
             'treating it as not alarming. Please report this value on the issue tracker.',
         )
       }
+    }
+
+    const comm = data.commStatus
+    if (
+      typeof comm === 'string' &&
+      comm !== 'ok' &&
+      comm !== 'error' &&
+      !warnedCommStatus.has(comm)
+    ) {
+      warnedCommStatus.add(comm)
+      logWarn(
+        `Unrecognized commStatus "${comm}" on ${data.name || data.zid}; ` +
+          'not treating it as a fault. Please report this value on the issue tracker.',
+      )
     }
   }
 

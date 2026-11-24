@@ -37,6 +37,14 @@
         "additionalProperties": { "type": "string" },
         "description": "Custom display names keyed by device ID (managed via the settings UI)"
       },
+      "lowBatteryThreshold": {
+        "title": "Low Battery Threshold (%)",
+        "type": "integer",
+        "default": 20,
+        "minimum": 0,
+        "maximum": 100,
+        "description": "For detectors that report a numeric battery level: show the low-battery warning at or below this percentage. A detector that reports its battery as \"low\" always shows the warning."
+      },
       "debug": {
         "title": "Debug Logging",
         "type": "boolean",

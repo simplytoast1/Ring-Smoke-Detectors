@@ -8,6 +8,8 @@ export interface RingSmokeDetectorsConfig extends PlatformConfig {
   hiddenDevices?: string[]
   /** Custom display names, keyed by device zid */
   deviceNames?: Record<string, string>
+  /** Numeric battery level (percent) at or below which the battery is low */
+  lowBatteryThreshold?: number
 }
 
 export const PLATFORM_NAME = 'RingSmokeDetectors'

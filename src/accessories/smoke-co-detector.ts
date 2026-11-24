@@ -8,6 +8,7 @@
  * - SmokeSensor: SmokeDetected characteristic
  * - CarbonMonoxideSensor: CarbonMonoxideDetected + CarbonMonoxideLevel
  * - Battery: BatteryLevel, StatusLowBattery, ChargingState
+ * The low-battery warning is also mirrored onto both sensor services.
  *
  * Alarm state is read from the WebSocket device data. We check two locations
  * for compatibility across firmware versions:
@@ -20,15 +21,20 @@ import type { PlatformAccessory } from 'homebridge'
 import { BehaviorSubject } from 'rxjs'
 import { hap } from '../hap.js'
 import type { SmokeDetectorDeviceData } from '../ring-api/types.js'
-import { BaseAccessory, type AvailabilitySource } from './base-accessory.js'
+import {
+  BaseAccessory,
+  type AccessoryOptions,
+  type AvailabilitySource,
+} from './base-accessory.js'
 
 export class SmokeCoDetectorAccessory extends BaseAccessory {
   constructor(
     accessory: PlatformAccessory,
     deviceData: BehaviorSubject<SmokeDetectorDeviceData>,
     availability?: AvailabilitySource,
+    options?: AccessoryOptions,
   ) {
-    super(accessory, deviceData, availability)
+    super(accessory, deviceData, availability, options)
 
     // Smoke Sensor service, which triggers HomeKit smoke alerts
     const smokeSensor = this.getOrAddService(hap.Service.SmokeSensor)
@@ -53,6 +59,8 @@ export class SmokeCoDetectorAccessory extends BaseAccessory {
 
     // Tamper and fault reporting on the primary service
     this.setupStatusCharacteristics(smokeSensor)
+    // Low-battery warning on the sensor tile itself
+    this.registerLowBattery(smokeSensor)
 
     // Carbon Monoxide Sensor service, triggers HomeKit CO alerts
     const coSensor = this.getOrAddService(
@@ -85,6 +93,8 @@ export class SmokeCoDetectorAccessory extends BaseAccessory {
       (data) =>
         Math.max(0, Math.min(100, data.components?.['co.level']?.reading ?? 0)),
     )
+
+    this.registerLowBattery(coSensor)
 
     // Battery service (all models have batteries, even wired ones as backup)
     this.setupBatteryService()

@@ -212,6 +212,11 @@ export interface SmokeDetectorDeviceData {
   batteryStatus?: 'full' | 'charged' | 'ok' | 'low' | 'none' | 'charging'
   /** AC power status for wired models */
   acStatus?: 'error' | 'ok'
+  /**
+   * Whether Ring can currently talk to the device. "ok" is the healthy value
+   * and "error" the confirmed unhealthy one; other spellings are logged.
+   */
+  commStatus?: string
   /** Manufacturer name */
   manufacturerName?: string
   /** Device serial number */
@@ -249,8 +254,10 @@ export interface RingLocation {
  * beams_bridge*. By also accepting sensor_bluejay*, we enable WebSocket
  * connections for hubless Kidde detectors.
  */
-export function isKiddeAsset(asset: TicketAsset): boolean {
-  return asset.kind.startsWith('sensor_bluejay')
+export function isKiddeAsset(asset: TicketAsset | null | undefined): boolean {
+  // Guarded: this runs on raw API data, and a single entry without a string
+  // "kind" must not throw and take the whole location down with it.
+  return typeof asset?.kind === 'string' && asset.kind.startsWith('sensor_bluejay')
 }
 
 /**
@@ -259,8 +266,10 @@ export function isKiddeAsset(asset: TicketAsset): boolean {
  * security-panel devices (which Ring creates for monitored locations
  * but don't have burglar-alarm capability, causing HomeKit errors).
  */
-export function isKiddeDeviceType(deviceType: string): boolean {
-  return deviceType.includes('sensor_bluejay')
+export function isKiddeDeviceType(deviceType: unknown): boolean {
+  // Guarded for the same reason as isKiddeAsset: a device entry that has a
+  // zid but no deviceType is simply "not a Kidde detector", never a crash.
+  return typeof deviceType === 'string' && deviceType.includes('sensor_bluejay')
 }
 
 /**
@@ -305,6 +314,21 @@ export function flattenDeviceData(
   return result as SmokeDetectorDeviceData
 }
 
+/**
+ * Flatten a whole DeviceInfoDocGetList body, dropping entries that are not
+ * objects or have no usable zid. Returns [] for anything that is not an array.
+ */
+export function flattenDeviceList(body: unknown): SmokeDetectorDeviceData[] {
+  if (!Array.isArray(body)) return []
+  const devices: SmokeDetectorDeviceData[] = []
+  for (const entry of body) {
+    if (entry === null || typeof entry !== 'object') continue
+    const flat = flattenDeviceData(entry)
+    if (typeof flat.zid === 'string' && flat.zid.length > 0) devices.push(flat)
+  }
+  return devices
+}
+
 function isPlainObject(value: unknown): value is Record<string, any> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -344,14 +368,24 @@ export const IMPULSE_ALARM_TESTING = 'alarm.testing'
  * percentage. The enum values come from ring-client-api's type union; only
  * "full" has been observed on real hardware so far. HomeKit's Battery service
  * wants a number, so each category maps to an approximate percentage. An
- * unrecognized or missing status reports no value at all rather than a
- * fabricated one.
+ * unrecognized or missing status has no entry here; the accessory then holds
+ * the last level it could determine. "low" sits well under the default
+ * low-battery threshold so the level and the warning agree.
  */
 export const BATTERY_STATUS_PERCENT: Record<string, number> = {
   full: 100,
   charged: 100,
   charging: 100,
   ok: 75,
-  low: 20,
-  none: 0,
+  low: 10,
 }
+
+/**
+ * batteryStatus value meaning "no battery data" (seen in ring-client-api's
+ * type union for mains-powered devices). It is not an empty battery, so it
+ * maps to no percentage at all rather than 0%.
+ */
+export const BATTERY_STATUS_NO_DATA = 'none'
+
+/** Default percentage at or below which a numeric level counts as low */
+export const DEFAULT_LOW_BATTERY_THRESHOLD = 20

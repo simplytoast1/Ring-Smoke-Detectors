@@ -15,15 +15,20 @@ import type { PlatformAccessory } from 'homebridge'
 import { BehaviorSubject } from 'rxjs'
 import { hap } from '../hap.js'
 import type { SmokeDetectorDeviceData } from '../ring-api/types.js'
-import { BaseAccessory, type AvailabilitySource } from './base-accessory.js'
+import {
+  BaseAccessory,
+  type AccessoryOptions,
+  type AvailabilitySource,
+} from './base-accessory.js'
 
 export class SmokeDetectorAccessory extends BaseAccessory {
   constructor(
     accessory: PlatformAccessory,
     deviceData: BehaviorSubject<SmokeDetectorDeviceData>,
     availability?: AvailabilitySource,
+    options?: AccessoryOptions,
   ) {
-    super(accessory, deviceData, availability)
+    super(accessory, deviceData, availability, options)
 
     // Smoke Sensor service only (no CO for this device type)
     const smokeSensor = this.getOrAddService(hap.Service.SmokeSensor)
@@ -47,6 +52,8 @@ export class SmokeDetectorAccessory extends BaseAccessory {
 
     // Tamper and fault reporting on the primary service
     this.setupStatusCharacteristics(smokeSensor)
+    // Low-battery warning on the sensor tile itself
+    this.registerLowBattery(smokeSensor)
 
     // Battery service
     this.setupBatteryService()

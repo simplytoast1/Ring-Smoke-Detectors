@@ -40,9 +40,15 @@
  * - Reconnect with jittered exponential backoff that never gives up. A
  *   transiently empty asset list during reconnect is retried, not treated
  *   as "no devices".
+ *
+ * AVAILABILITY IS PER DETECTOR, not per connection. Each detector is its own
+ * asset, so the socket can be perfectly healthy while one detector has fallen
+ * off wifi. A detector only counts as available once it has delivered state
+ * on the CURRENT connection, and stops counting if it then goes silent for
+ * DEVICE_STALE_MS. Otherwise it would keep presenting its last "no smoke"
+ * reading as current for as long as any other detector kept answering.
  */
 
-import { WebSocket } from 'undici'
 import {
   Subject,
   BehaviorSubject,
@@ -62,6 +68,7 @@ import {
 } from 'rxjs/operators'
 import type { RingRestClient } from './ring-rest-client.js'
 import { appApi } from './ring-rest-client.js'
+import { openSocket, SOCKET_OPEN, type RingSocket } from './socket-factory.js'
 import {
   TicketResponse,
   TicketAsset,
@@ -69,6 +76,7 @@ import {
   SmokeDetectorDeviceData,
   isKiddeAsset,
   flattenDeviceData,
+  flattenDeviceList,
   extractImpulses,
 } from './types.js'
 import { logInfo, logWarn, logError, logDebug, delay } from '../util.js'
@@ -86,11 +94,27 @@ const WATCHDOG_INTERVAL_MS = 30_000
  * connection is considered half-open and gets forcibly reconnected.
  */
 const STALE_CONNECTION_MS = 180_000
+/**
+ * How long one detector may go without delivering any state before it is
+ * reported as not responding, even though the location's socket is up.
+ *
+ * Deliberately the same window as STALE_CONNECTION_MS. The watchdog already
+ * bets that a healthy location produces traffic within this window (every
+ * asset is polled once a minute); this applies the same bet to each detector
+ * individually instead of letting one talkative detector vouch for the rest.
+ */
+const DEVICE_STALE_MS = STALE_CONNECTION_MS
 /** How long getDevices() waits before settling with whatever it has */
 const GET_DEVICES_TIMEOUT_MS = 20_000
 
 /** Outcome of a connection attempt */
 export type ConnectResult = 'connected' | 'no-assets'
+
+/** Whether one detector is currently delivering state */
+export interface DeviceAvailability {
+  readonly connected: boolean
+  readonly onConnected: Observable<boolean>
+}
 
 export class SmokeDetectorWebSocket {
   /**
@@ -144,6 +168,19 @@ export class SmokeDetectorWebSocket {
    */
   public readonly onDevices: Observable<SmokeDetectorDeviceData[]>
 
+  /**
+   * The devices contained in ONE device-list answer, emitted as it arrives.
+   *
+   * THIS is the stream to sync state from: every entry was just reported by
+   * the asset that answered. onDevices, by contrast, re-emits the accumulated
+   * document of EVERY device at the location whenever ANY asset answers, so
+   * applying it replays old state onto detectors that did not answer. With
+   * two detectors that replay overwrote a live alarm (delivered on the
+   * DataUpdate channel) with the pre-alarm "inactive" from the last poll, as
+   * soon as the other detector answered its own poll.
+   */
+  public readonly onDeviceListUpdate: Observable<SmokeDetectorDeviceData[]>
+
   /** Assets from the ticket response that we're tracking */
   private assets: TicketAsset[] = []
 
@@ -177,7 +214,7 @@ export class SmokeDetectorWebSocket {
   private latestDevices: SmokeDetectorDeviceData[] = []
   /** Sequence number for WebSocket messages (incremented per message) */
   private seq = 1
-  private socket: WebSocket | null = null
+  private socket: RingSocket | null = null
   private reconnecting = false
   /**
    * Set whenever a reconnect is requested, including while a reconnect loop
@@ -199,6 +236,15 @@ export class SmokeDetectorWebSocket {
   private awaitingFirstDocument = false
   private pollTimer: ReturnType<typeof setInterval> | null = null
   private watchdogTimer: ReturnType<typeof setInterval> | null = null
+  /** When each device (zid) last delivered state on the CURRENT connection */
+  private readonly deviceLastSeen = new Map<string, number>()
+  /** Per-device availability handed to accessories, keyed by zid */
+  private readonly deviceAvailability = new Map<
+    string,
+    BehaviorSubject<boolean>
+  >()
+  /** Devices flagged as silent while the socket itself was up (for logging) */
+  private readonly quietDevices = new Set<string>()
 
   constructor(
     private readonly locationId: string,
@@ -260,22 +306,15 @@ export class SmokeDetectorWebSocket {
           }
 
           // Merge new devices into accumulated list (update existing, add new)
-          const merged = deviceList.reduce(
-            (acc: SmokeDetectorDeviceData[], data: any) => {
-              if (data === null || typeof data !== 'object') return acc
-              const flat = flattenDeviceData(data)
-              if (typeof flat.zid !== 'string' || !flat.zid) return acc
-              const existingIndex = acc.findIndex(
-                (d) => d.zid === flat.zid,
-              )
-              if (existingIndex >= 0) {
-                acc[existingIndex] = { ...acc[existingIndex], ...flat }
-                return acc
-              }
-              return [...acc, flat]
-            },
-            [...devices],
-          )
+          const merged = [...devices]
+          for (const flat of flattenDeviceList(deviceList)) {
+            const existingIndex = merged.findIndex((d) => d.zid === flat.zid)
+            if (existingIndex >= 0) {
+              merged[existingIndex] = { ...merged[existingIndex], ...flat }
+            } else {
+              merged.push(flat)
+            }
+          }
           this.latestDevices = merged
           return merged
         },
@@ -304,6 +343,80 @@ export class SmokeDetectorWebSocket {
       map(({ devices }) => devices),
       shareReplay(1),
     )
+
+    // Fresh, per-answer view of the same messages (see the property docs).
+    this.onDeviceListUpdate = onDeviceList.pipe(
+      map((message) => flattenDeviceList(message.body)),
+      filter((devices) => devices.length > 0),
+    )
+  }
+
+  /**
+   * Availability of ONE detector, for binding to its HomeKit accessory.
+   *
+   * True only while the socket is up AND this detector has delivered state on
+   * the current connection within DEVICE_STALE_MS. The returned object stays
+   * valid across reconnects.
+   */
+  availabilityFor(zid: string): DeviceAvailability {
+    let subject = this.deviceAvailability.get(zid)
+    if (!subject) {
+      subject = new BehaviorSubject<boolean>(
+        this.isDeviceFresh(zid, Date.now()),
+      )
+      this.deviceAvailability.set(zid, subject)
+    }
+    const current = subject
+    return {
+      get connected() {
+        return current.value
+      },
+      onConnected: current.asObservable(),
+    }
+  }
+
+  private isDeviceFresh(zid: string, now: number): boolean {
+    if (this.disconnected || !this.onConnectedSubject.value) return false
+    const seen = this.deviceLastSeen.get(zid)
+    return seen !== undefined && now - seen <= DEVICE_STALE_MS
+  }
+
+  /** Record that these devices just delivered state on this connection. */
+  private noteDevicesSeen(devices: SmokeDetectorDeviceData[]): void {
+    if (devices.length === 0) return
+    const now = Date.now()
+    for (const { zid } of devices) this.deviceLastSeen.set(zid, now)
+    this.refreshDeviceAvailability(now)
+  }
+
+  /**
+   * Recompute every detector's availability and publish the changes. Runs
+   * when state arrives, when the connection changes, and on each watchdog
+   * tick (which is what notices a detector that has simply gone quiet).
+   */
+  private refreshDeviceAvailability(now = Date.now()): void {
+    for (const [zid, subject] of this.deviceAvailability) {
+      const fresh = this.isDeviceFresh(zid, now)
+      if (fresh === subject.value) continue
+
+      if (!fresh && this.onConnectedSubject.value) {
+        // The socket is fine; this one detector stopped answering.
+        this.quietDevices.add(zid)
+        logWarn(
+          `Detector "${this.deviceName(zid)}" at "${this.locationName}" has not reported in ` +
+            `${DEVICE_STALE_MS / 1000}s. It will show as not responding in HomeKit until it reports again.`,
+        )
+      } else if (fresh && this.quietDevices.delete(zid)) {
+        logInfo(
+          `Detector "${this.deviceName(zid)}" at "${this.locationName}" is reporting again`,
+        )
+      }
+      subject.next(fresh)
+    }
+  }
+
+  private deviceName(zid: string): string {
+    return this.latestDevices.find((d) => d.zid === zid)?.name || zid
   }
 
   /**
@@ -417,7 +530,7 @@ export class SmokeDetectorWebSocket {
     // Same URL format as ring-client-api: wss://{host}/ws?authcode={ticket}&ack=false
     // The ack=false parameter disables message acknowledgment (simpler protocol).
     const wsUrl = `wss://${host}/ws?authcode=${ticket}&ack=false`
-    const socket = new WebSocket(wsUrl)
+    const socket = openSocket(wsUrl)
     this.socket = socket
 
     // Wait for the connection to open before proceeding
@@ -503,9 +616,13 @@ export class SmokeDetectorWebSocket {
         this.onMessage.next(message)
 
         // Fresh device state has arrived, so this connection can now be
-        // treated as available for reporting to HomeKit.
+        // treated as available for reporting to HomeKit. The devices in
+        // this answer are marked as seen only AFTER the data above has
+        // propagated, so a detector never flips to available while HomeKit
+        // still holds its pre-outage values.
         if (message.msg === 'DeviceInfoDocGetList') {
           this.announceAvailable()
+          this.noteDevicesSeen(flattenDeviceList(message.body))
         }
 
         // Real-time state updates (alarm triggered, battery changed, etc.)
@@ -519,6 +636,8 @@ export class SmokeDetectorWebSocket {
           this.announceAvailable()
           this.onDataUpdate.next(message)
           this.emitImpulses(message)
+          // A pushed update is proof of life for that detector too
+          this.noteDevicesSeen(flattenDeviceList(message.body))
         }
       } catch (error) {
         logDebug(`Failed to parse websocket message: ${error}`)
@@ -603,7 +722,10 @@ export class SmokeDetectorWebSocket {
           `No websocket traffic for location "${this.locationName}" in ${STALE_CONNECTION_MS / 1000}s, forcing reconnect`,
         )
         this.reconnect()
+        return
       }
+      // The socket is alive; check whether any single detector went quiet
+      this.refreshDeviceAvailability()
     }, WATCHDOG_INTERVAL_MS)
     this.watchdogTimer.unref()
   }
@@ -634,6 +756,7 @@ export class SmokeDetectorWebSocket {
     if (!this.onConnectedSubject.value) {
       this.onConnectedSubject.next(true)
     }
+    this.refreshDeviceAvailability()
   }
 
   /**
@@ -645,7 +768,7 @@ export class SmokeDetectorWebSocket {
     return (
       !this.disconnected &&
       this.socket !== null &&
-      this.socket.readyState === WebSocket.OPEN
+      this.socket.readyState === SOCKET_OPEN
     )
   }
 
@@ -663,9 +786,13 @@ export class SmokeDetectorWebSocket {
     } catch {
       // ignore close errors during cleanup
     }
+    // Nothing heard on this connection counts toward the next one: after a
+    // reconnect each detector must report again before it is available.
+    this.deviceLastSeen.clear()
     if (this.onConnectedSubject.value) {
       this.onConnectedSubject.next(false)
     }
+    this.refreshDeviceAvailability()
   }
 
   /**
@@ -746,7 +873,7 @@ export class SmokeDetectorWebSocket {
    * { channel: 'message', msg: { msg, dst, seq } }
    */
   private sendMessage(message: Record<string, any>): void {
-    if (this.socket?.readyState !== WebSocket.OPEN) {
+    if (this.socket?.readyState !== SOCKET_OPEN) {
       logDebug('Cannot send message: websocket not open')
       return
     }
@@ -807,8 +934,13 @@ export class SmokeDetectorWebSocket {
 
     // Report unavailable before completing, so any accessory still bound to
     // this connection stops presenting its last reading as current.
+    this.deviceLastSeen.clear()
     if (this.onConnectedSubject.value) {
       this.onConnectedSubject.next(false)
+    }
+    this.refreshDeviceAvailability()
+    for (const subject of this.deviceAvailability.values()) {
+      subject.complete()
     }
     this.onMessage.complete()
     this.onDataUpdate.complete()

@@ -13,7 +13,8 @@
     "build": "rm -rf dist && swc src -d dist --strip-leading-paths && cp -r src/homebridge-ui/public dist/homebridge-ui/public",
     "watch": "swc src -d dist --strip-leading-paths --watch",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run typecheck && npm run build"
+    "test": "npm run build && node --test test/*.test.mjs",
+    "prepublishOnly": "npm run typecheck && npm test"
   },
   "keywords": [
     "homebridge-plugin",
