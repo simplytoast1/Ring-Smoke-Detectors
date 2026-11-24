@@ -495,6 +495,21 @@ export class RingRestClient {
   }
 
   /**
+   * Complete a 2FA login and keep the resulting session on this client.
+   *
+   * getAuth(code) alone returns the tokens but does not cache them, so the
+   * next request on this client would sign in again with the refresh token
+   * the login just produced, spending it. Caching the result lets follow-up
+   * requests (the settings page's device scan) reuse the access token and
+   * leave the new refresh token untouched.
+   */
+  async authenticateWithCode(code: string): Promise<OAuthResponse> {
+    const auth = await this.getAuth(code)
+    this._authPromise = Promise.resolve(auth)
+    return auth
+  }
+
+  /**
    * Force a fresh token exchange, replacing the given stale attempt.
    *
    * Ring's refresh tokens are effectively single-use, so two concurrent

@@ -157,6 +157,10 @@ export function createSim(t) {
     tokenSeq: 0,
     /** Optional override: () => Response for the OAuth endpoint */
     oauth: null,
+    /** When true, the locations request fails with a server error */
+    failLocations: false,
+    /** Location ids whose ticket request fails with a server error */
+    failTickets: new Set(),
     logs: [],
     logged: (pattern) => sim.logs.some((line) => pattern.test(line)),
     configToken: () =>
@@ -240,9 +244,13 @@ export function createSim(t) {
       return json({ access_token: 'at', refresh_token: `rt${++sim.tokenSeq}`, expires_in: 3600 })
     }
     if (url.includes('clients_api/session')) return json({})
-    if (url.includes('devices/v1/locations')) return json({ user_locations: sim.locations })
+    if (url.includes('devices/v1/locations')) {
+      if (sim.failLocations) return json({ error: 'unavailable' }, 500)
+      return json({ user_locations: sim.locations })
+    }
     if (url.includes('clap/tickets')) {
       const id = new URL(url).searchParams.get('locationID')
+      if (sim.failTickets.has(id)) return json({ error: 'unavailable' }, 500)
       return json({ assets: sim.assets[id] ?? [], ticket: id, host: 'ring.test' })
     }
     return json({}, 404)

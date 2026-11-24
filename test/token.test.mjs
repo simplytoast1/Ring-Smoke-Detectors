@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, readFileSync, statSync, lstatSync, symlinkS
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createSim, deviceDoc, kiddeAsset, encodeToken } from './helpers/sim.mjs'
-import { persistRotatedToken, readConfigRefreshToken } from '../dist/ring-api/config-store.js'
+import { persistRotatedToken, readConfigRefreshToken, readRefreshTokenFromFile } from '../dist/ring-api/config-store.js'
 import { RingRestClient, RingApiError, RingAuthError } from '../dist/ring-api/ring-rest-client.js'
 
 const posixOnly = { skip: process.platform === 'win32' && 'POSIX file modes and symlinks' }
@@ -62,6 +62,15 @@ test('a token from a new login is never overwritten', (t) => {
 
   assert.equal(result.outcome, 'foreign')
   assert.equal(readFileSync(path, 'utf8'), before, 'file untouched')
+})
+
+test('the settings page can read the token config.json holds right now', (t) => {
+  const { api, path } = tempConfig(t, 'TOKEN_A')
+  assert.equal(readRefreshTokenFromFile(path), 'TOKEN_A')
+  // the plugin rotates while the settings page is open
+  persistRotatedToken(api, 'TOKEN_B', new Set(['TOKEN_A']))
+  assert.equal(readRefreshTokenFromFile(path), 'TOKEN_B')
+  assert.equal(readRefreshTokenFromFile(join(path, 'missing')), undefined)
 })
 
 test('only the token changes: other plugins and formatting are preserved', (t) => {

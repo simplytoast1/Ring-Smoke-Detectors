@@ -3,8 +3,12 @@
 
   States:
   1. Not authenticated: show "Log In" button and login form
-  2. Authenticated: auto-discover devices, show device list with
-     model info, custom names, and show/hide toggles
+  2. Authenticated: show the devices the running plugin has discovered,
+     with model info, custom names, and show/hide toggles
+
+  Token rule: this page never causes a Ring sign-in with a saved token.
+  Ring's tokens are single-use and the running plugin owns the one in
+  config.json. Logging in is the only thing here that talks to Ring.
 -->
 <style>
   .ring-container {
@@ -166,10 +170,13 @@
   let currentEmail = '';
   let currentPassword = '';
   let discoveredDevices = [];
-  // Discovery authenticates and Ring rotates the refresh token. We hold the
-  // replacement here and persist it only when the user clicks Save, so the
-  // discovery/render path never blocks on a config write.
-  let rotatedRefreshToken = null;
+
+  const NOT_LOGGED_IN =
+    'Log in with your Ring account to connect your smoke detectors.';
+  const NOTHING_FROM_PLUGIN =
+    'The plugin has not reported any detectors yet. If you have just logged in or restarted Homebridge, ' +
+    'give it a minute and click Refresh Devices. If this persists, check the Homebridge log, ' +
+    'or use Re-authenticate to scan Ring now.';
 
   const modelNames = {
     'sensor_bluejay_wsc': 'Kidde Smart Smoke + CO Alarm (Wired)',
@@ -215,12 +222,12 @@
     const pluginConfig = config[0] || {};
 
     if (pluginConfig.refreshToken) {
-      showStatus('Authenticated. Discovering devices...', 'success');
+      showStatus('Authenticated. Loading devices...', 'success');
       document.getElementById('loginSection').classList.add('hidden');
       document.getElementById('deviceSection').classList.remove('hidden');
       await loadDevices(pluginConfig);
     } else {
-      showStatus('Log in with your Ring account to connect your smoke detectors.', 'warning');
+      showStatus(NOT_LOGGED_IN, 'warning');
     }
   })();
 
@@ -247,7 +254,7 @@
         showStatus('Authenticated.', 'success');
         document.getElementById('deviceSection').classList.remove('hidden');
       } else {
-        showStatus('Log in with your Ring account to connect your smoke detectors.', 'warning');
+        showStatus(NOT_LOGGED_IN, 'warning');
         document.getElementById('loginSection').classList.remove('hidden');
       }
     });
@@ -268,7 +275,7 @@
     try {
       const response = await homebridge.request('/send-code', { email, password });
       if (response.refreshToken) {
-        await saveToken(response.refreshToken);
+        await completeLogin(response);
       } else if (response.codePrompt) {
         document.getElementById('codePrompt').textContent = response.codePrompt;
         document.getElementById('loginForm').classList.add('hidden');
@@ -296,7 +303,7 @@
         code,
       });
       if (response.refreshToken) {
-        await saveToken(response.refreshToken);
+        await completeLogin(response);
       }
     } catch (e) {
       homebridge.toast.error(e.message || 'Verification failed. Please try again.');
@@ -305,10 +312,14 @@
     }
   }
 
-  async function saveToken(refreshToken) {
+  // A finished login arrives with the device list already attached: the
+  // server scans with the session the login created. So the token below is
+  // final. It is saved once, awaited, and nothing signs in with it afterwards
+  // except the plugin itself.
+  async function completeLogin(response) {
     const config = await homebridge.getPluginConfig();
     const pluginConfig = config[0] || { platform: 'RingSmokeDetectors' };
-    pluginConfig.refreshToken = refreshToken;
+    pluginConfig.refreshToken = response.refreshToken;
 
     await homebridge.updatePluginConfig([pluginConfig]);
     await homebridge.savePluginConfig();
@@ -316,59 +327,51 @@
     homebridge.toast.success('Logged in successfully!');
     currentEmail = '';
     currentPassword = '';
+    document.getElementById('password').value = '';
+    document.getElementById('code').value = '';
 
     // Transition to authenticated state
     document.getElementById('loginForm').classList.add('hidden');
     document.getElementById('codeForm').classList.add('hidden');
     document.getElementById('loginSection').classList.add('hidden');
     document.getElementById('deviceSection').classList.remove('hidden');
-    showStatus('Authenticated. Discovering devices...', 'success');
 
-    // Fresh login: the plugin hasn't cached devices yet, so discover live
-    await loadDevices(pluginConfig, true);
+    discoveredDevices = response.devices || [];
+    renderDeviceList(pluginConfig);
+
+    const count = discoveredDevices.length;
+    const failed = response.failedLocations || [];
+    const restart = 'Restart Homebridge so the plugin starts using this login.';
+    if (response.scanFailed) {
+      showStatus(`Logged in, but the device scan did not complete. ${restart} It will discover your detectors itself.`, 'warning');
+    } else if (failed.length > 0) {
+      showStatus(`Logged in. Found ${count} device(s), but some locations could not be reached: ${failed.join(', ')}. ${restart}`, 'warning');
+    } else if (count === 0) {
+      showStatus('Logged in, but no Kidde smoke detectors were found. Make sure your devices are set up in the Ring app.', 'info');
+    } else {
+      showStatus(`Logged in. Found ${count} device(s). ${restart}`, 'success');
+    }
   }
 
-  // ─── Device Discovery ─────────────────────────────────────────────────
+  // ─── Device List ──────────────────────────────────────────────────────
 
-  // forceRefresh=false reads the running plugin's device cache: no Ring auth,
-  // so it never rotates the plugin's token. forceRefresh=true does a live Ring
-  // discovery and is used ONLY right after login (the login token, not the
-  // running plugin's token, is what gets rotated there).
-  async function loadDevices(pluginConfig, forceRefresh) {
+  // Shows what the RUNNING PLUGIN has discovered (its device cache). This
+  // never contacts Ring: a scan from here would have to sign in with the
+  // plugin's own single-use token and could knock the plugin offline.
+  async function loadDevices(pluginConfig) {
     homebridge.showSpinner();
     try {
-      const response = await homebridge.request('/devices', {
-        refreshToken: pluginConfig.refreshToken,
-        forceRefresh: !!forceRefresh,
-      });
-
-      // A live discovery rotates the token. Persist the replacement to config
-      // immediately (not deferred to Save) so config never holds a dead token.
-      // Fire-and-forget so a slow savePluginConfig can't hang the spinner.
-      if (response.refreshToken && response.refreshToken !== pluginConfig.refreshToken) {
-        rotatedRefreshToken = response.refreshToken;
-        pluginConfig.refreshToken = response.refreshToken;
-        Promise.resolve()
-          .then(() => homebridge.updatePluginConfig([pluginConfig]))
-          .then(() => homebridge.savePluginConfig())
-          .catch(() => { /* will still be saved on the user's Save */ });
-      }
-
+      const response = await homebridge.request('/devices');
       discoveredDevices = response.devices || [];
       renderDeviceList(pluginConfig);
 
-      const failed = response.failedLocations || [];
-      if (failed.length > 0) {
-        showStatus(`Found ${discoveredDevices.length} device(s), but some locations could not be reached: ${failed.join(', ')}. Check the Homebridge UI logs and try again.`, 'warning');
-      } else if (discoveredDevices.length === 0) {
-        showStatus(response.cacheEmpty
-          ? 'No devices cached by the plugin yet. Click Refresh Devices to scan Ring now.'
-          : 'No Kidde smoke detectors found. Make sure your devices are set up in the Ring app.', 'info');
+      if (discoveredDevices.length === 0) {
+        showStatus(NOTHING_FROM_PLUGIN, 'info');
       } else {
-        showStatus(`Found ${discoveredDevices.length} device(s)${response.fromCache ? ' (from plugin).' : '.'}`, 'success');
+        showStatus(`Found ${discoveredDevices.length} device(s) (from plugin).`, 'success');
       }
     } catch (e) {
-      showStatus((e && e.message) ? `Failed to load devices: ${e.message}` : 'Failed to load devices. Check your connection and try again.', 'warning');
+      showStatus((e && e.message) ? `Failed to load devices: ${e.message}` : 'Failed to load devices. Please try again.', 'warning');
     } finally {
       homebridge.hideSpinner();
     }
@@ -381,12 +384,8 @@
       homebridge.toast.error('Not authenticated.');
       return;
     }
-    // Explicit user action, so do a real scan of Ring rather than only
-    // re-reading the plugin's cache. Opening the settings page still uses
-    // the cache (and never authenticates); this button is the escape hatch
-    // for when the plugin has not cached anything yet.
-    showStatus('Scanning Ring for devices...', 'success');
-    await loadDevices(pluginConfig, true);
+    showStatus('Checking what the plugin has discovered...', 'success');
+    await loadDevices(pluginConfig);
   }
 
   function renderDeviceList(pluginConfig) {
@@ -438,6 +437,21 @@
     const config = await homebridge.getPluginConfig();
     const pluginConfig = config[0] || { platform: 'RingSmokeDetectors' };
 
+    // This page's copy of the config dates from when the settings were
+    // opened. The plugin rotates its Ring token about once an hour and
+    // writes the new one to config.json, so saving our copy as it stands
+    // could put a spent token back. Take the token from disk right before
+    // saving, and do not save at all if that cannot be checked.
+    try {
+      const current = await homebridge.request('/current-token');
+      if (current && typeof current.refreshToken === 'string' && current.refreshToken) {
+        pluginConfig.refreshToken = current.refreshToken;
+      }
+    } catch (e) {
+      homebridge.toast.error('Could not check the current Ring token, so nothing was saved. Please try again.');
+      return;
+    }
+
     // Collect hidden devices (unchecked checkboxes)
     const hiddenDevices = [];
     document.querySelectorAll('.checkbox-row input').forEach(input => {
@@ -457,12 +471,6 @@
 
     pluginConfig.hiddenDevices = hiddenDevices.length > 0 ? hiddenDevices : undefined;
     pluginConfig.deviceNames = Object.keys(deviceNames).length > 0 ? deviceNames : undefined;
-
-    // Persist the token Ring rotated to during discovery, if any, so the
-    // stored token stays valid
-    if (rotatedRefreshToken) {
-      pluginConfig.refreshToken = rotatedRefreshToken;
-    }
 
     await homebridge.updatePluginConfig([pluginConfig]);
     await homebridge.savePluginConfig();

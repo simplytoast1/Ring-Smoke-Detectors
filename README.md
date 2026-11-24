@@ -86,7 +86,7 @@ If you prefer, add this to your Homebridge `config.json` under `platforms`:
 
 ## How It Works
 
-1. **Authentication**: OAuth token management with automatic token rotation. Ring rotates the refresh token periodically, so the plugin writes each new token back into your `config.json` (the same approach the reference homebridge-ring plugin uses) to keep a valid token available across restarts. The settings page reads the plugin's discovered-device cache rather than logging in again, so opening settings never disturbs the running plugin's token.
+1. **Authentication**: OAuth token management with automatic token rotation. Ring rotates the refresh token periodically, so the plugin writes each new token back into your `config.json` (the same approach the reference homebridge-ring plugin uses) to keep a valid token available across restarts. The settings page shows the plugin's discovered-device list rather than logging in again, and Save always keeps the token that is currently in `config.json`, so opening, refreshing, or saving settings never disturbs the running plugin's token. Only an explicit login talks to Ring from the settings page.
 2. **Location Discovery**: Fetches all Ring locations, then probes each one via WebSocket. If a location can't be reached, the others still come up and the failed one is retried on its own schedule. Locations are re-checked hourly, so a detector added later is picked up without restarting Homebridge.
 3. **WebSocket Connection**: Requests a ticket from Ring's `clap/tickets` endpoint and establishes a direct WebSocket connection, even without a Ring hub.
 4. **Device Discovery**: Sends `DeviceInfoDocGetList` requests over the WebSocket to discover devices and their current state.

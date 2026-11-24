@@ -229,7 +229,20 @@ export function persistRotatedToken(
  */
 export function readConfigRefreshToken(api: API): string | undefined {
   try {
-    const configPath = api.user.configPath()
+    return readRefreshTokenFromFile(api.user.configPath())
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Same, for a caller that only has the path to config.json (the settings UI
+ * server, which runs outside Homebridge and has no API object).
+ */
+export function readRefreshTokenFromFile(
+  configPath: string,
+): string | undefined {
+  try {
     return tokenFromConfig(JSON.parse(readFileSync(configPath, 'utf8')))
   } catch {
     return undefined
