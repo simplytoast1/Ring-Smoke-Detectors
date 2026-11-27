@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createSim, deviceDoc, kiddeAsset, hap, FakePlatformAccessory, isResponding, sleep } from './helpers/sim.mjs'
+import { createSim, deviceDoc, kiddeAsset, hap, FakePlatformAccessory, isResponding, sleep, until } from './helpers/sim.mjs'
+import { readCache } from '../dist/ring-api/device-cache.js'
 
 function twoLocations(sim) {
   sim.locations = [
@@ -79,4 +80,22 @@ test('unexpected entries from Ring are ignored instead of crashing the bridge', 
   assert.deepEqual(uncaught, [], 'no uncaught exception')
   assert.equal(api.registered.length, 1, 'the mystery device did not become an accessory')
   assert.ok(isResponding(accessory('Hallway')))
+})
+
+test('the settings page is told about every location, including excluded ones', async (t) => {
+  const sim = createSim(t)
+  twoLocations(sim)
+  const { api } = await sim.boot({ config: { locationIds: ['L1'] } })
+  assert.deepEqual(api.registered.map((a) => a.displayName), ['Home Hallway'], 'only the chosen location is managed')
+
+  let cache
+  await until(
+    () => {
+      readCache(sim.storage).then((c) => (cache = c))
+      return cache?.devices.length === 1 && cache.locations.length === 2
+    },
+    { what: 'the device list to be written' },
+  )
+  assert.deepEqual(cache.locations, [{ id: 'L1', name: 'Home' }, { id: 'L2', name: 'Cabin' }], 'the excluded cabin can still be offered')
+  assert.equal(cache.devices[0].locationId, 'L1')
 })

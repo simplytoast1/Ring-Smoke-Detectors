@@ -16,7 +16,7 @@
 
 import { HomebridgePluginUiServer, RequestError } from '@homebridge/plugin-ui-utils'
 import { RingRestClient } from '../ring-api/ring-rest-client.js'
-import { readDeviceCache } from '../ring-api/device-cache.js'
+import { readCache } from '../ring-api/device-cache.js'
 import { readRefreshTokenFromFile } from '../ring-api/config-store.js'
 import { completeLogin } from './login-discovery.js'
 
@@ -107,7 +107,8 @@ class RingSmokeDetectorsUiServer extends HomebridgePluginUiServer {
   }
 
   /**
-   * The devices the RUNNING PLUGIN has discovered, read from its cache.
+   * The devices the RUNNING PLUGIN has discovered, read from its cache,
+   * along with every Ring location on the account.
    *
    * This never talks to Ring. Scanning from here would mean signing in with
    * the token in config.json, which is the running plugin's token: spending
@@ -116,8 +117,15 @@ class RingSmokeDetectorsUiServer extends HomebridgePluginUiServer {
    */
   async cachedDevices() {
     const storagePath = this.homebridgeStoragePath
-    const devices = storagePath ? await readDeviceCache(storagePath) : []
-    return { devices, fromCache: true, cacheEmpty: devices.length === 0 }
+    const { devices, locations } = storagePath
+      ? await readCache(storagePath)
+      : { devices: [], locations: [] }
+    return {
+      devices,
+      locations,
+      fromCache: true,
+      cacheEmpty: devices.length === 0,
+    }
   }
 
   /**

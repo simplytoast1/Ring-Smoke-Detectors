@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { createSim, deviceDoc, kiddeAsset } from './helpers/sim.mjs'
 import { RingRestClient } from '../dist/ring-api/ring-rest-client.js'
 import { completeLogin } from '../dist/homebridge-ui/login-discovery.js'
-import { readDeviceCache, writeDeviceCache } from '../dist/ring-api/device-cache.js'
+import { readCache, readDeviceCache, writeDeviceCache } from '../dist/ring-api/device-cache.js'
 
 // Dummy credentials: every request in these tests goes to the simulated Ring
 const credentials = { email: 'user@example.test', password: 'not-a-real-password' }
@@ -32,6 +32,8 @@ test('a password login scans for devices without spending the new token', async 
   const result = await completeLogin(client, sim.storage)
 
   assert.deepEqual(names(result.devices), ['Hallway', 'Kitchen', 'Loft'])
+  assert.deepEqual(result.locations, [{ id: 'L1', name: 'Home' }, { id: 'L2', name: 'Cabin' }])
+  assert.equal(result.devices.find((d) => d.name === 'Loft').locationId, 'L2')
   assert.equal(sim.tokenSeq, 1, 'Ring was asked for a token exactly once')
   assert.equal(tokenInside(result.refreshToken), 'rt1', 'the page gets the token the login produced')
   assert.equal(result.scanFailed, false)
@@ -58,6 +60,7 @@ test("the login scan seeds an empty device list and never replaces the plugin's"
   await first.getCurrentAuth()
   await completeLogin(first, sim.storage)
   assert.deepEqual(names(await readDeviceCache(sim.storage)), ['Hallway', 'Kitchen', 'Loft'], 'list survives reopening the page')
+  assert.deepEqual((await readCache(sim.storage)).locations.map((l) => l.name), ['Home', 'Cabin'])
 
   // Once the running plugin has written its own list, that list wins
   const fromPlugin = [{ zid: 'A1', name: 'Hallway (plugin)', deviceType: 'comp.bluejay.sensor_bluejay_wsc', locationName: 'Home' }]

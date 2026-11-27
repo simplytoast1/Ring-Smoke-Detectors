@@ -59,6 +59,7 @@ npm install -g homebridge-ring-smoke-detectors
 5. If prompted, enter your **2FA verification code**
 6. Your devices will be discovered automatically and shown in the settings page
 7. Optionally rename devices or uncheck any you want to hide from HomeKit
+8. If your Ring account has more than one location, optionally choose which locations the plugin manages
 
 Your Ring credentials are sent directly to Ring's servers and are **not stored**. Only the resulting refresh token is saved, and the plugin automatically handles token rotation.
 
@@ -78,11 +79,13 @@ If you prefer, add this to your Homebridge `config.json` under `platforms`:
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `refreshToken` | string | *required* | Ring refresh token (generated via the settings UI) |
-| `locationIds` | string[] | all locations | Limit to specific Ring location IDs |
+| `locationIds` | string[] | all locations | Ring locations to manage (chosen by name in the settings UI). While this is set, a location added to your Ring account later is not included until you switch it on |
 | `hiddenDevices` | string[] | none | Device IDs to exclude from HomeKit (managed via settings UI) |
 | `deviceNames` | object | none | Custom display names by device ID (managed via settings UI) |
-| `lowBatteryThreshold` | number | `20` | For detectors that report a numeric battery level: show the low-battery warning at or below this percentage |
-| `debug` | boolean | `false` | Log the plugin's debug messages at info level |
+| `debug` | boolean | `false` | Log the plugin's debug messages at info level (also a checkbox in the settings UI) |
+| `lowBatteryThreshold` | number | `20` | Config file only. For detectors that report a numeric battery level, which none are known to do yet: show the low-battery warning at or below this percentage |
+
+Saving in the settings UI only changes what the page is showing. Hidden flags and custom names for detectors that are not listed at that moment are kept.
 
 ## How It Works
 
@@ -102,7 +105,7 @@ Pressing the physical test button on a detector is detected and written to the H
 
 - Ensure your Kidde/Ring detectors are set up and online in the Ring app
 - Check the Homebridge logs for discovery messages
-- Enable `"debug": true` in the config for verbose logging
+- Turn on **Debug logging** in the plugin settings (or set `"debug": true` in the config) for verbose logging
 
 ### Token Issues
 

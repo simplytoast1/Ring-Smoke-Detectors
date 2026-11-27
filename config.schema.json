@@ -23,7 +23,7 @@
         "title": "Location IDs",
         "type": "array",
         "items": { "type": "string" },
-        "description": "Optional: limit to specific Ring location IDs"
+        "description": "Ring locations this plugin manages. Leave empty for all locations. Chosen by name in the settings UI."
       },
       "hiddenDevices": {
         "title": "Hidden Devices",
@@ -43,15 +43,14 @@
         "default": 20,
         "minimum": 0,
         "maximum": 100,
-        "description": "For detectors that report a numeric battery level: show the low-battery warning at or below this percentage. A detector that reports its battery as \"low\" always shows the warning."
+        "description": "Only for detectors that report a numeric battery level, which none are known to do yet: show the low-battery warning at or below this percentage. A detector that reports its battery as \"low\" always shows the warning."
       },
       "debug": {
         "title": "Debug Logging",
         "type": "boolean",
         "default": false,
-        "description": "Log the plugin's debug messages at info level so they appear without running Homebridge in debug mode"
+        "description": "Log the plugin's debug messages at info level so they appear without running Homebridge in debug mode. Also available as a checkbox in the settings UI."
       }
-    },
-    "required": ["refreshToken"]
+    }
   }
 }

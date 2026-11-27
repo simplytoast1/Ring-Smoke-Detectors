@@ -28,6 +28,7 @@ import {
   readDeviceCache,
   writeDeviceCache,
   type CachedDevice,
+  type CachedLocation,
 } from '../ring-api/device-cache.js'
 import { openSocket } from '../ring-api/socket-factory.js'
 import {
@@ -44,6 +45,8 @@ const LOCATION_SCAN_TIMEOUT_MS = 10_000
 
 export interface ScanResult {
   devices: CachedDevice[]
+  /** Every location on the account, with or without detectors */
+  locations: CachedLocation[]
   /** Names of locations that could not be scanned at all */
   failedLocations: string[]
   /** True when every location answered in full */
@@ -54,6 +57,7 @@ export interface LoginResult {
   /** The token to save to config.json. Final: nothing spends it afterwards. */
   refreshToken: string
   devices: CachedDevice[]
+  locations: CachedLocation[]
   failedLocations: string[]
   /** True when the scan could not run at all. The login itself succeeded. */
   scanFailed: boolean
@@ -67,8 +71,9 @@ export interface LoginResult {
 function scanLocation(
   wsUrl: string,
   assets: TicketAsset[],
-  locationName: string,
+  location: RingLocation,
 ): Promise<{ devices: CachedDevice[]; complete: boolean }> {
+  const locationName = location.name
   return new Promise((resolve, reject) => {
     const devices: CachedDevice[] = []
     const answered = new Set<string>()
@@ -121,6 +126,7 @@ function scanLocation(
             name: device.name || 'Smoke Detector',
             deviceType: device.deviceType,
             locationName,
+            locationId: location.location_id,
             batteryLevel: device.batteryLevel,
             batteryStatus: device.batteryStatus,
           })
@@ -168,7 +174,7 @@ export async function scanDevices(client: RingRestClient): Promise<ScanResult> {
       const result = await scanLocation(
         `wss://${ticket.host}/ws?authcode=${ticket.ticket}&ack=false`,
         assets,
-        location.name,
+        location,
       )
       for (const device of result.devices) byZid.set(device.zid, device)
       if (!result.complete) complete = false
@@ -184,7 +190,14 @@ export async function scanDevices(client: RingRestClient): Promise<ScanResult> {
     }
   }
 
-  return { devices: [...byZid.values()], failedLocations, complete }
+  return {
+    devices: [...byZid.values()],
+    locations: locations
+      .filter((l) => typeof l?.location_id === 'string' && l.location_id)
+      .map((l) => ({ id: l.location_id, name: l.name || l.location_id })),
+    failedLocations,
+    complete,
+  }
 }
 
 /**
@@ -198,7 +211,12 @@ export async function completeLogin(
   client: RingRestClient,
   storagePath?: string,
 ): Promise<LoginResult> {
-  let scan: ScanResult = { devices: [], failedLocations: [], complete: false }
+  let scan: ScanResult = {
+    devices: [],
+    locations: [],
+    failedLocations: [],
+    complete: false,
+  }
   let scanFailed = false
   try {
     client.refreshSession()
@@ -225,7 +243,7 @@ export async function completeLogin(
   if (storagePath && scan.complete && scan.devices.length > 0) {
     try {
       if ((await readDeviceCache(storagePath)).length === 0) {
-        await writeDeviceCache(storagePath, scan.devices)
+        await writeDeviceCache(storagePath, scan.devices, scan.locations)
       }
     } catch (error) {
       console.error('Could not save the discovered device list:', error)
@@ -235,6 +253,7 @@ export async function completeLogin(
   return {
     refreshToken,
     devices: scan.devices,
+    locations: scan.locations,
     failedLocations: scan.failedLocations,
     scanFailed,
   }

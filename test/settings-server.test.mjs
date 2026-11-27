@@ -49,8 +49,9 @@ test('the settings server answers from disk without signing in to Ring', async (
     join(storage, 'config.json'),
     JSON.stringify({ platforms: [{ platform: 'RingSmokeDetectors', refreshToken: 'TOKEN_ON_DISK' }] }),
   )
-  const cached = [{ zid: 'A1', name: 'Hallway', deviceType: 'comp.bluejay.sensor_bluejay_wsc', locationName: 'Home' }]
-  await writeDeviceCache(storage, cached)
+  const cached = [{ zid: 'A1', name: 'Hallway', deviceType: 'comp.bluejay.sensor_bluejay_wsc', locationName: 'Home', locationId: 'L1' }]
+  const locations = [{ id: 'L1', name: 'Home' }, { id: 'L2', name: 'Cabin' }]
+  await writeDeviceCache(storage, cached, locations)
 
   const request = await startServer(t, storage)
 
@@ -58,7 +59,7 @@ test('the settings server answers from disk without signing in to Ring', async (
   // made the server sign in with the saved token, no longer does anything.
   const devices = await request('/devices', { refreshToken: 'TOKEN_ON_DISK', forceRefresh: true })
   assert.equal(devices.success, true)
-  assert.deepEqual(devices.data, { devices: cached, fromCache: true, cacheEmpty: false })
+  assert.deepEqual(devices.data, { devices: cached, locations, fromCache: true, cacheEmpty: false })
 
   const token = await request('/current-token')
   assert.deepEqual(token.data, { refreshToken: 'TOKEN_ON_DISK' })

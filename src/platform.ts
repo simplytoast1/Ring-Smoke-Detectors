@@ -84,6 +84,7 @@ import {
 } from './ring-api/config-store.js'
 import {
   CachedDevice,
+  CachedLocation,
   writeDeviceCache,
 } from './ring-api/device-cache.js'
 import {
@@ -221,6 +222,13 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
 
   /** zids seen during the current discovery run, used to prune removed devices */
   private cacheZidsThisRun = new Set<string>()
+
+  /**
+   * Every Ring location on the account, for the settings-UI cache. Includes
+   * locations excluded by the locationIds option: the settings page needs
+   * them to offer locations by name and to let one be switched back on.
+   */
+  private locationsForCache: CachedLocation[] = []
 
   /** Set when Homebridge fires shutdown; stops all retry/discovery loops */
   private shuttingDown = false
@@ -545,6 +553,9 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
     // here as a RingAuthError even when every location is already connected.
     let locations = await fetchAllLocations(client)
 
+    // Publish the full list (before filtering) for the settings page
+    this.updateLocationCache(locations)
+
     // Allow users to limit which Ring locations this plugin manages
     if (config.locationIds?.length) {
       locations = locations.filter((loc) =>
@@ -711,7 +722,7 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
       // Publish to the settings-UI cache BEFORE creating accessories, since
       // handleDiscoveredDevice mutates device.name with the user's override
       // and the cache needs the raw Ring name.
-      this.updateDeviceCache(devices, location.name)
+      this.updateDeviceCache(devices, location)
 
       // Create HomeKit accessories for each Kidde smoke/CO device
       const known = new Set<string>()
@@ -752,7 +763,7 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
       // an "error" callback is supplied), and Homebridge shuts down on those.
       ws.onDeviceListUpdate.subscribe({
         next: guard('device list', location.name, (updatedDevices) => {
-          this.updateDeviceCache(updatedDevices, location.name)
+          this.updateDeviceCache(updatedDevices, location)
           // Keep the per-location zid set current. A device discovered here
           // (rather than during the initial probe) must be recorded, or the
           // next cleanup pass would treat it as removed, unregister it, and
@@ -966,7 +977,7 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
    */
   private updateDeviceCache(
     devices: SmokeDetectorDeviceData[],
-    locationName: string,
+    location: RingLocation,
   ): void {
     let changed = false
     for (const device of devices) {
@@ -976,7 +987,8 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
         zid: device.zid,
         name: device.name || 'Smoke Detector',
         deviceType: device.deviceType,
-        locationName,
+        locationName: location.name,
+        locationId: location.location_id,
         batteryLevel: device.batteryLevel,
         batteryStatus: device.batteryStatus,
       }
@@ -1005,10 +1017,24 @@ export class RingSmokeDetectorsPlatform implements DynamicPlatformPlugin {
     if (changed) this.writeCache()
   }
 
+  /** Record the account's locations for the settings page, if they changed. */
+  private updateLocationCache(locations: RingLocation[]): void {
+    const next: CachedLocation[] = locations
+      .filter(
+        (l) => typeof l?.location_id === 'string' && l.location_id.length > 0,
+      )
+      .map((l) => ({ id: l.location_id, name: l.name || l.location_id }))
+    if (JSON.stringify(next) === JSON.stringify(this.locationsForCache)) return
+    this.locationsForCache = next
+    this.writeCache()
+  }
+
   private writeCache(): void {
-    writeDeviceCache(this.storagePath, [
-      ...this.discoveredForCache.values(),
-    ]).catch((error) => logError(`Failed to write device cache: ${error}`))
+    writeDeviceCache(
+      this.storagePath,
+      [...this.discoveredForCache.values()],
+      this.locationsForCache,
+    ).catch((error) => logError(`Failed to write device cache: ${error}`))
   }
 
   /**
